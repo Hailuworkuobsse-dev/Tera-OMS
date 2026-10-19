@@ -1,0 +1,6 @@
+// ─────────────────────────────────────────────────────────
+// credit module — tables prefixed credit_
+// Owned by services/api/src/modules/credit/repository.ts
+// ─────────────────────────────────────────────────────────
+
+// (add models here as the module is built)

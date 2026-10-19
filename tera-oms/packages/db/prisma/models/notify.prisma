@@ -1,0 +1,6 @@
+// ─────────────────────────────────────────────────────────
+// notify module — tables prefixed notify_
+// Owned by services/api/src/modules/notify/repository.ts
+// ─────────────────────────────────────────────────────────
+
+// (add models here as the module is built)

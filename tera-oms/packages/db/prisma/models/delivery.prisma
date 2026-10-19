@@ -1,0 +1,6 @@
+// ─────────────────────────────────────────────────────────
+// delivery module — tables prefixed delivery_
+// Owned by services/api/src/modules/delivery/repository.ts
+// ─────────────────────────────────────────────────────────
+
+// (add models here as the module is built)

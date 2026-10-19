@@ -1,0 +1,6 @@
+// ─────────────────────────────────────────────────────────
+// masterdata module — tables prefixed masterdata_
+// Owned by services/api/src/modules/masterdata/repository.ts
+// ─────────────────────────────────────────────────────────
+
+// (add models here as the module is built)

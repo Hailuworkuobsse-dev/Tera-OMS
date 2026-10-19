@@ -1,0 +1,6 @@
+// ─────────────────────────────────────────────────────────
+// geo module — tables prefixed geo_
+// Owned by services/api/src/modules/geo/repository.ts
+// ─────────────────────────────────────────────────────────
+
+// (add models here as the module is built)

@@ -1,0 +1,9 @@
+{
+  "name": "@tera/telemetry",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": { "lint": "tsc --noEmit", "test": "vitest run", "build": "tsc -b" },
+  "devDependencies": { "typescript": "^5.4.0", "vitest": "^1.6.0" }
+}

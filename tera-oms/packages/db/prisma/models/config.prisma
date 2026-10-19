@@ -1,0 +1,6 @@
+// ─────────────────────────────────────────────────────────
+// config module — tables prefixed config_
+// Owned by services/api/src/modules/config/repository.ts
+// ─────────────────────────────────────────────────────────
+
+// (add models here as the module is built)

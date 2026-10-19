@@ -1,0 +1,6 @@
+// ─────────────────────────────────────────────────────────
+// audit module — tables prefixed audit_
+// Owned by services/api/src/modules/audit/repository.ts
+// ─────────────────────────────────────────────────────────
+
+// (add models here as the module is built)

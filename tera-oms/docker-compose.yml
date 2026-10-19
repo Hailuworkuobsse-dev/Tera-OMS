@@ -1,0 +1,50 @@
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: tera
+      MYSQL_USER: tera
+      MYSQL_PASSWORD: tera
+    ports: ["3306:3306"]
+    volumes: [mysqldata:/var/lib/mysql]
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-utera", "-ptera"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+
+  api:
+    build: ./services/api
+    env_file: .env
+    depends_on:
+      mysql: { condition: service_healthy }
+      redis: { condition: service_started }
+    ports: ["8000:8000"]
+    volumes:
+      - ./services/api:/app
+      - ./packages:/packages
+      - ./seeds:/seeds
+
+  worker:
+    build: ./services/worker
+    env_file: .env
+    depends_on: [redis, mysql]
+    volumes:
+      - ./services/worker:/app
+      - ./packages:/packages
+
+  optimizer:
+    build: ./services/optimizer
+    env_file: .env
+    depends_on: [redis]
+    volumes:
+      - ./services/optimizer:/app
+      - ./packages:/packages
+
+volumes:
+  mysqldata:

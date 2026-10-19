@@ -1,0 +1,6 @@
+// ─────────────────────────────────────────────────────────
+// payments module — tables prefixed payments_
+// Owned by services/api/src/modules/payments/repository.ts
+// ─────────────────────────────────────────────────────────
+
+// (add models here as the module is built)
