@@ -9946,3 +9946,3070 @@ echo "All 8 frontends, 3 backend services, all modules."
 echo ""
 echo "Reply 'yes' to finish with Part 3."
 echo "════════════════════════════════════════════════════════════════"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# PHASE 6a — BACKEND: ANALYTICS (ROI computation)
+# ═══════════════════════════════════════════════════════════════════
+echo "▸ Phase 6a — analytics backend"
+
+W services/api/src/modules/analytics/metrics.ts <<'EOF'
+import type { Tile } from '@tera/contracts';
+
+export interface MetricSpec {
+  key: Tile['metric_key']; labelKey: string; unit: string;
+  direction: 'up' | 'down'; targetMode: 'relative' | 'absolute';
+  targetMin: number; targetMax: number;
+}
+
+export const METRIC_SPECS: MetricSpec[] = [
+  { key: 'variable_cost_per_month_etb',       labelKey: 'exec.tile.variable_cost', unit: 'ETB',         direction: 'down', targetMode: 'relative', targetMin: 15, targetMax: 20 },
+  { key: 'km_per_delivery',                    labelKey: 'exec.tile.km',            unit: 'km',          direction: 'down', targetMode: 'relative', targetMin: 10, targetMax: 15 },
+  { key: 'median_delivery_hours',              labelKey: 'exec.tile.delivery_time', unit: 'h',           direction: 'down', targetMode: 'relative', targetMin: 15, targetMax: 35 },
+  { key: 'on_time_sla_pct',                    labelKey: 'exec.tile.on_time',       unit: '%',           direction: 'up',   targetMode: 'relative', targetMin: 20, targetMax: 30 },
+  { key: 'stockout_sku_days_per_month',        labelKey: 'exec.tile.stockout',      unit: 'SKU-days',    direction: 'down', targetMode: 'relative', targetMin: 25, targetMax: 40 },
+  { key: 'dock_turnaround_minutes',            labelKey: 'exec.tile.dock',          unit: 'min',         direction: 'down', targetMode: 'relative', targetMin: 20, targetMax: 30 },
+  { key: 'reserve_violations_per_100_routes',  labelKey: 'exec.tile.fuel_risk',     unit: '/100',        direction: 'down', targetMode: 'relative', targetMin: 10, targetMax: 25 },
+  { key: 'deliveries_per_vehicle_per_day',     labelKey: 'exec.tile.fleet',         unit: 'del',         direction: 'up',   targetMode: 'relative', targetMin: 15, targetMax: 20 },
+  { key: 'clean_epod_rate_pct',                labelKey: 'exec.tile.accuracy',      unit: '%',           direction: 'up',   targetMode: 'absolute', targetMin: 95, targetMax: 99 },
+  { key: 'credit_blocked_pre_dispatch_pct',    labelKey: 'exec.tile.credit',        unit: '%',           direction: 'up',   targetMode: 'absolute', targetMin: 99, targetMax: 100 },
+];
+
+export interface Assumptions {
+  monthlyDeliveries: number; monthlyRoutes: number; dailyVehicles: number;
+  vehicleWearEtbPerKm: number; marginPerSkuDayEtb: number;
+  costPerFuelIncidentEtb: number; avgMarginPerDeliveryEtb: number;
+}
+
+export const DEFAULT_ASSUMPTIONS: Assumptions = {
+  monthlyDeliveries: 1200, monthlyRoutes: 120, dailyVehicles: 10,
+  vehicleWearEtbPerKm: 3.5, marginPerSkuDayEtb: 500,
+  costPerFuelIncidentEtb: 2000, avgMarginPerDeliveryEtb: 250,
+};
+
+export function computeImprovement(spec: MetricSpec, baseline: number, current: number): number {
+  if (spec.targetMode === 'absolute') return spec.direction === 'up' ? current - baseline : baseline - current;
+  if (baseline === 0) return 0;
+  return spec.direction === 'up' ? ((current - baseline) / baseline) * 100 : ((baseline - current) / baseline) * 100;
+}
+export function isInTarget(spec: MetricSpec, baseline: number, current: number): boolean {
+  if (spec.targetMode === 'absolute') return spec.direction === 'up' ? current >= spec.targetMin : current <= spec.targetMax;
+  return computeImprovement(spec, baseline, current) >= spec.targetMin;
+}
+export function isFullyInTarget(spec: MetricSpec, baseline: number, current: number): boolean {
+  if (spec.targetMode === 'absolute') return spec.direction === 'up' ? current >= spec.targetMax : current <= spec.targetMin;
+  return computeImprovement(spec, baseline, current) >= spec.targetMax;
+}
+export function computeEtbImpact(spec: MetricSpec, baseline: number, current: number, a: Assumptions): number | null {
+  switch (spec.key) {
+    case 'variable_cost_per_month_etb': return Math.max(0, baseline - current);
+    case 'km_per_delivery': return Math.max(0, baseline - current) * a.monthlyDeliveries * a.vehicleWearEtbPerKm;
+    case 'stockout_sku_days_per_month': return Math.max(0, baseline - current) * a.marginPerSkuDayEtb;
+    case 'reserve_violations_per_100_routes': return (Math.max(0, baseline - current) / 100) * a.monthlyRoutes * a.costPerFuelIncidentEtb;
+    case 'deliveries_per_vehicle_per_day': return Math.max(0, current - baseline) * a.dailyVehicles * a.avgMarginPerDeliveryEtb * 30;
+    default: return null;
+  }
+}
+export function buildTile(spec: MetricSpec, baseline: number, current: number, trend: number[], assumptions: Assumptions): Tile {
+  return {
+    metric_key: spec.key, label_key: spec.labelKey, unit: spec.unit,
+    baseline, current, target_min: spec.targetMin, target_max: spec.targetMax,
+    direction: spec.direction, target_mode: spec.targetMode,
+    improvement_pct: Math.round(computeImprovement(spec, baseline, current) * 100) / 100,
+    in_target: isInTarget(spec, baseline, current),
+    fully_in_target: isFullyInTarget(spec, baseline, current),
+    trend_7d: trend,
+    etb_impact: computeEtbImpact(spec, baseline, current, assumptions),
+  };
+}
+export function computeHero(tiles: Tile[], baselineFrozenAt: Date, now: Date = new Date()) {
+  const cost = tiles.find((t) => t.metric_key === 'variable_cost_per_month_etb');
+  if (!cost || cost.etb_impact === null) return null;
+  const days = Math.max(0, Math.floor((now.getTime() - baselineFrozenAt.getTime()) / 86_400_000));
+  const monthly = cost.etb_impact;
+  return { monthly_savings_etb: Math.round(monthly), cumulative_savings_etb: Math.round((monthly / 30) * days), annualized_savings_etb: Math.round(monthly * 12), days_since_baseline: days };
+}
+EOF
+
+W services/api/src/modules/analytics/repository.ts <<'EOF'
+import { db } from '@tera/db';
+export const findBaselines = () => db().baseline.findMany();
+export const upsertBaseline = (i: any) => db().baseline.upsert({ where: { key: i.key }, create: i, update: i });
+export const getLatestSnapshot = (key: string) => db().metricSnapshot.findFirst({ where: { key }, orderBy: { date: 'desc' } });
+export const getLastNDays = (key: string, n: number) => db().metricSnapshot.findMany({ where: { key }, orderBy: { date: 'desc' }, take: n });
+export const getAssumptions = () => db().costAssumption.findMany();
+export const upsertAssumption = (key: string, value: number, unit: string) => db().costAssumption.upsert({ where: { key }, create: { key, value, unit }, update: { value } });
+export const getFlag = (key: string) => db().setting.findUnique({ where: { key } });
+export const setFlag = (key: string, value: string) => db().setting.upsert({ where: { key }, create: { key, value }, update: { value } });
+EOF
+
+W services/api/src/modules/analytics/service.ts <<'EOF'
+import type { DashboardResponse, Tile, CostAssumption, FreezeBaselineRequest } from '@tera/contracts';
+import * as repo from './repository.js';
+import { METRIC_SPECS, DEFAULT_ASSUMPTIONS, buildTile, computeHero, type Assumptions } from './metrics.js';
+
+function assumptionsFromRows(rows: { key: string; value: number }[]): Assumptions {
+  const m = new Map(rows.map((r) => [r.key, r.value]));
+  return {
+    monthlyDeliveries: m.get('monthly_deliveries') ?? DEFAULT_ASSUMPTIONS.monthlyDeliveries,
+    monthlyRoutes: m.get('monthly_routes') ?? DEFAULT_ASSUMPTIONS.monthlyRoutes,
+    dailyVehicles: m.get('daily_vehicles') ?? DEFAULT_ASSUMPTIONS.dailyVehicles,
+    vehicleWearEtbPerKm: m.get('vehicle_wear_etb_per_km') ?? DEFAULT_ASSUMPTIONS.vehicleWearEtbPerKm,
+    marginPerSkuDayEtb: m.get('margin_per_sku_day_etb') ?? DEFAULT_ASSUMPTIONS.marginPerSkuDayEtb,
+    costPerFuelIncidentEtb: m.get('cost_per_fuel_incident_etb') ?? DEFAULT_ASSUMPTIONS.costPerFuelIncidentEtb,
+    avgMarginPerDeliveryEtb: m.get('avg_margin_per_delivery_etb') ?? DEFAULT_ASSUMPTIONS.avgMarginPerDeliveryEtb,
+  };
+}
+async function isDemoMode() { const r = await repo.getFlag('analytics.demoMode'); return r?.value === 'true'; }
+
+export async function getDashboard(): Promise<DashboardResponse> {
+  const [baselineRows, assumptionRows, demoMode] = await Promise.all([repo.findBaselines(), repo.getAssumptions(), isDemoMode()]);
+  if (baselineRows.length === 0) return { as_of: new Date().toISOString(), baseline_frozen_at: null, is_demo: demoMode, hero: null, tiles: [] };
+  const assumptions = assumptionsFromRows(assumptionRows);
+  const baselineMap = new Map(baselineRows.map((b) => [b.key, b]));
+  const frozenAt = baselineRows[0]!.frozenAt;
+  const tiles: Tile[] = [];
+  for (const spec of METRIC_SPECS) {
+    const b = baselineMap.get(spec.key); if (!b) continue;
+    const current = await repo.getLatestSnapshot(spec.key); if (!current) continue;
+    const trendRows = await repo.getLastNDays(spec.key, 7);
+    const trend = trendRows.slice().reverse().map((r) => Math.round(r.value * 100) / 100);
+    tiles.push(buildTile(spec, b.value, current.value, trend, assumptions));
+  }
+  return { as_of: new Date().toISOString(), baseline_frozen_at: frozenAt.toISOString(), is_demo: demoMode, hero: computeHero(tiles, frozenAt), tiles };
+}
+
+export async function freezeBaseline(input: FreezeBaselineRequest, actorId: string): Promise<DashboardResponse> {
+  for (const spec of METRIC_SPECS) {
+    const current = await repo.getLatestSnapshot(spec.key);
+    if (!current) continue;
+    await repo.upsertBaseline({ key: spec.key, value: current.value, unit: spec.unit, notes: input.notes ?? null, frozenAt: new Date(), frozenBy: actorId });
+  }
+  await repo.setFlag('analytics.demoMode', 'false');
+  return getDashboard();
+}
+
+export async function listAssumptions(): Promise<{ assumptions: CostAssumption[] }> {
+  const rows = await repo.getAssumptions();
+  return { assumptions: rows.map((r) => ({ key: r.key, value: r.value, unit: r.unit, updated_at: r.updatedAt.toISOString() })) };
+}
+export async function updateAssumption(key: string, value: number): Promise<CostAssumption> {
+  const existing = await repo.getAssumptions();
+  const cur = existing.find((r) => r.key === key);
+  if (!cur) { const e = new Error(`assumption "${key}" not found`) as any; e.statusCode = 404; throw e; }
+  const u = await repo.upsertAssumption(key, value, cur.unit);
+  return { key: u.key, value: u.value, unit: u.unit, updated_at: u.updatedAt.toISOString() };
+}
+EOF
+
+W services/api/src/modules/analytics/routes.ts <<'EOF'
+import type { FastifyPluginAsync } from 'fastify';
+import { DashboardResponseSchema, FreezeBaselineRequestSchema, CostAssumptionsResponseSchema, UpdateCostAssumptionSchema, CostAssumptionSchema } from '@tera/contracts';
+import * as s from './service.js';
+export const analyticsRoutes: FastifyPluginAsync = async (app) => {
+  app.get('/dashboard', { schema: { response: { 200: DashboardResponseSchema as any } } }, async () => s.getDashboard());
+  app.post('/baseline/freeze', { schema: { body: FreezeBaselineRequestSchema as any, response: { 200: DashboardResponseSchema as any } } },
+    async (req: any) => s.freezeBaseline(req.body ?? {}, req.user?.sub ?? 'admin'));
+  app.get('/cost-assumptions', { schema: { response: { 200: CostAssumptionsResponseSchema as any } } }, async () => s.listAssumptions());
+  app.patch('/cost-assumptions/:key', { schema: { body: UpdateCostAssumptionSchema as any, response: { 200: CostAssumptionSchema as any } } },
+    async (req: any) => s.updateAssumption(req.params.key, req.body.value));
+};
+EOF
+W services/api/src/modules/analytics/index.ts <<'EOF'
+import type { FastifyPluginAsync } from 'fastify';
+import { analyticsRoutes } from './routes.js';
+export const analyticsPlugin: FastifyPluginAsync = async (app) => { await app.register(analyticsRoutes); };
+export default analyticsPlugin;
+EOF
+
+# ═══════════════════════════════════════════════════════════════════
+# PHASE 6b — BACKEND: PAYMENTS (reconciliation)
+# ═══════════════════════════════════════════════════════════════════
+echo "▸ Phase 6b — payments backend"
+
+W services/api/src/modules/payments/rules.ts <<'EOF'
+export function canReconcile(input: { reconciledAt: string | null }) {
+  if (input.reconciledAt !== null) return { allowed: false, reason: 'already reconciled' };
+  return { allowed: true, reason: null };
+}
+EOF
+W services/api/src/modules/payments/repository.ts <<'EOF'
+import { db } from '@tera/db';
+export function findUnreconciled(limit: number) { return db().payment.findMany({ where: { reconciledAt: null }, orderBy: { receivedAt: 'desc' }, take: limit }); }
+export function findRouteStopsByIds(ids: string[]) { return db().routeStop.findMany({ where: { id: { in: ids } }, include: { routePlan: { select: { driverId: true, vehicleId: true } } } }); }
+export function findById(id: string) { return db().payment.findUnique({ where: { id } }); }
+export function reconcile(id: string, actorId: string, notes: string | null) {
+  return db().payment.update({ where: { id }, data: { reconciledAt: new Date(), reconciledBy: actorId, reconcileNotes: notes } });
+}
+EOF
+W services/api/src/modules/payments/service.ts <<'EOF'
+import type { UnreconciledPaymentsResponse, ReconcileResponse } from '@tera/contracts';
+import * as repo from './repository.js';
+import { canReconcile } from './rules.js';
+import { writeAudit } from '../../core/audit.js';
+export async function listUnreconciled(limit = 100): Promise<UnreconciledPaymentsResponse> {
+  const rows = await repo.findUnreconciled(limit);
+  const stops = await repo.findRouteStopsByIds(Array.from(new Set(rows.map((r) => r.routeStopId))));
+  const byId = new Map(stops.map((s) => [s.id, s]));
+  return { total: rows.length, payments: rows.map((p) => {
+    const s = byId.get(p.routeStopId);
+    return { id: p.id, route_stop_id: p.routeStopId, driver_id: s?.routePlan.driverId ?? '?', vehicle_id: s?.routePlan.vehicleId ?? '?', distributor_name: s?.distributorName ?? '(unknown)', method: p.method as 'CASH'|'TELEBIRR', amount_etb: Number(p.amountEtb), telebirr_ref: p.telebirrRef, captured_at: p.capturedAt.toISOString() };
+  }) };
+}
+export async function reconcile(id: string, actorId: string, notes: string | null): Promise<ReconcileResponse> {
+  const payment = await repo.findById(id);
+  if (!payment) { const e = new Error('not found') as any; e.statusCode = 404; throw e; }
+  const gate = canReconcile({ reconciledAt: payment.reconciledAt?.toISOString() ?? null });
+  if (!gate.allowed) { const e = new Error(gate.reason!) as any; e.statusCode = 400; throw e; }
+  const updated = await repo.reconcile(id, actorId, notes);
+  await writeAudit({ actorId, entity: 'payment', entityId: id, action: 'reconciled', reason: notes?.trim() || `${payment.method} payment reconciled`, meta: { amountEtb: Number(payment.amountEtb), method: payment.method } });
+  return { ok: true, reconciled_at: updated.reconciledAt!.toISOString() };
+}
+EOF
+W services/api/src/modules/payments/schemas.ts <<'EOF'
+export { UnreconciledPaymentsResponseSchema, ReconcileRequestSchema, ReconcileResponseSchema } from '@tera/contracts';
+EOF
+W services/api/src/modules/payments/routes.ts <<'EOF'
+import type { FastifyPluginAsync } from 'fastify';
+import { UnreconciledPaymentsResponseSchema, ReconcileRequestSchema, ReconcileResponseSchema } from './schemas.js';
+import * as s from './service.js';
+export const paymentsRoutes: FastifyPluginAsync = async (app) => {
+  app.get('/unreconciled', { schema: { response: { 200: UnreconciledPaymentsResponseSchema as any } } },
+    async (req: any) => s.listUnreconciled(req.query?.limit ? parseInt(req.query.limit, 10) : 100));
+  app.post('/:id/reconcile', { schema: { body: ReconcileRequestSchema as any, response: { 200: ReconcileResponseSchema as any } } },
+    async (req: any) => s.reconcile(req.params.id, req.user?.sub ?? 'finance', req.body?.notes ?? null));
+};
+EOF
+W services/api/src/modules/payments/index.ts <<'EOF'
+import type { FastifyPluginAsync } from 'fastify';
+import { paymentsRoutes } from './routes.js';
+export const paymentsPlugin: FastifyPluginAsync = async (app) => { await app.register(paymentsRoutes); };
+export default paymentsPlugin;
+EOF
+
+# ═══════════════════════════════════════════════════════════════════
+# PHASE 6c — BACKEND: PORTAL (distributor self-service)
+# ═══════════════════════════════════════════════════════════════════
+echo "▸ Phase 6c — portal backend"
+
+W services/api/src/modules/portal/cart.ts <<'EOF'
+export interface CartLine { skuId: string; quantity: number; unitPrice: number; weightKg: number; volumeM3: number; }
+export function computeCartTotals(lines: CartLine[]) {
+  let q = 0, s = 0, w = 0, v = 0;
+  for (const l of lines) { q += l.quantity; s += l.quantity * l.unitPrice; w += l.quantity * l.weightKg; v += l.quantity * l.volumeM3; }
+  return { lineCount: lines.length, totalQuantity: q, subtotalEtb: Math.round(s * 100) / 100, totalWeightKg: Math.round(w * 100) / 100, totalVolumeM3: Math.round(v * 1000) / 1000 };
+}
+export function computeHeadroom(input: { limitEtb: number; exposureEtb: number; cartSubtotalEtb: number }) {
+  const headroom = Math.max(0, input.limitEtb - input.exposureEtb);
+  const after = headroom - input.cartSubtotalEtb;
+  return { headroomEtb: Math.round(headroom * 100) / 100, afterOrderEtb: Math.round(after * 100) / 100, wouldExceed: after < 0 };
+}
+EOF
+W services/api/src/modules/portal/repository.ts <<'EOF'
+import { db } from '@tera/db';
+export const findDistributorWithCredit = (id: string) => db().distributor.findUnique({ where: { id }, include: { creditAccounts: true } });
+export const findActiveSkus = () => db().sku.findMany({ where: { active: true }, orderBy: { code: 'asc' } });
+export const findSkuByIds = (ids: string[]) => db().sku.findMany({ where: { id: { in: ids } } });
+export const findOrdersByDistributor = (id: string) => db().order.findMany({ where: { distributorId: id }, include: { lines: true }, orderBy: { createdAt: 'desc' }, take: 50 });
+export const findOrderByIdAndDistributor = (orderId: string, distId: string) => db().order.findFirst({ where: { id: orderId, distributorId: distId }, include: { lines: true } });
+export const findRouteStopByOrderId = (orderId: string) => db().routeStop.findFirst({ where: { orderId }, include: { routePlan: { select: { driverId: true, vehicleId: true, status: true } } } });
+export const findRecentDeliveries = (distId: string, limit: number) => db().routeStop.findMany({ where: { distributorId: distId, status: 'DELIVERED' }, include: { routePlan: { select: { vehicleId: true } } }, orderBy: { statusUpdatedAt: 'desc' }, take: limit });
+export const findDisputes = (distId: string) => db().dispute.findMany({ where: { distributorId: distId }, orderBy: { createdAt: 'desc' } });
+export const findLatestProofForOrder = (orderId: string) => db().proofOfDelivery.findFirst({ where: { orderId }, orderBy: { capturedAt: 'desc' } });
+export async function createOrderWithLines(input: any) {
+  const now = new Date();
+  return db().order.create({ data: {
+    distributorId: input.distributorId, distributorName: input.distributorName,
+    lat: input.lat, lng: input.lng, weightKg: input.weightKg, volumeM3: input.volumeM3,
+    priority: 5, timeWindowStart: new Date(now.getTime() + 3600_000), timeWindowEnd: new Date(now.getTime() + 86_400_000),
+    status: 'PENDING', totalQuantity: input.totalQuantity,
+    lines: { create: input.lines },
+  }, include: { lines: true } });
+}
+export const createDispute = (input: any) => db().dispute.create({ data: input });
+EOF
+W services/api/src/modules/portal/service.ts <<'EOF'
+import type { PortalProfile, CatalogItem, PlaceOrderRequest, PlaceOrderResponse, PortalOrdersResponse, PortalOrderSummary, PortalOrderDetail, StatementResponse, DisputeRow, RaiseDisputeRequest } from '@tera/contracts';
+import * as repo from './repository.js';
+import { computeCartTotals, computeHeadroom, type CartLine } from './cart.js';
+
+const r2 = (n: number) => Math.round(n * 100) / 100;
+const DEFAULT_LAT = 9.0108; const DEFAULT_LNG = 38.7613;
+
+export async function getProfile(distId: string): Promise<PortalProfile> {
+  const d = await repo.findDistributorWithCredit(distId);
+  if (!d) { const e = new Error('distributor not found') as any; e.statusCode = 404; throw e; }
+  const a = d.creditAccounts[0];
+  const limit = a ? Number(a.limitEtb) : 0; const exposure = a ? Number(a.exposureEtb) : 0;
+  return { distributor_id: d.id, name: d.name, region: d.region, credit_limit_etb: r2(limit), exposure_etb: r2(exposure), headroom_etb: r2(Math.max(0, limit - exposure)), utilization_pct: limit > 0 ? r2((exposure / limit) * 100) : 0 };
+}
+export async function getCatalog(): Promise<{ items: CatalogItem[] }> {
+  const skus = await repo.findActiveSkus();
+  return { items: skus.map((s) => ({ sku_id: s.id, code: s.code, name: s.name, unit: s.unit, weight_kg: Number(s.weightKg), volume_m3: Number(s.volumeM3), unit_price_etb: Number(s.unitPriceEtb), stock_on_hand: s.stockOnHand })) };
+}
+export async function placeOrder(distId: string, input: PlaceOrderRequest): Promise<PlaceOrderResponse> {
+  const profile = await getProfile(distId);
+  const skus = await repo.findSkuByIds(input.lines.map((l) => l.sku_id));
+  const byId = new Map(skus.map((s) => [s.id, s]));
+  const cartLines: CartLine[] = [];
+  for (const l of input.lines) {
+    const sku = byId.get(l.sku_id);
+    if (!sku) { const e = new Error(`unknown SKU ${l.sku_id}`) as any; e.statusCode = 400; throw e; }
+    if (sku.stockOnHand <= 0) { const e = new Error(`${sku.name} is out of stock`) as any; e.statusCode = 400; throw e; }
+    if (l.quantity > sku.stockOnHand) { const e = new Error(`${sku.name}: only ${sku.stockOnHand} in stock`) as any; e.statusCode = 400; throw e; }
+    cartLines.push({ skuId: sku.id, quantity: l.quantity, unitPrice: Number(sku.unitPriceEtb), weightKg: Number(sku.weightKg), volumeM3: Number(sku.volumeM3) });
+  }
+  const totals = computeCartTotals(cartLines);
+  const headroom = computeHeadroom({ limitEtb: profile.credit_limit_etb, exposureEtb: profile.exposure_etb, cartSubtotalEtb: totals.subtotalEtb });
+  if (headroom.wouldExceed) { const e = new Error(`Order exceeds credit headroom. Cart: ${totals.subtotalEtb} ETB, Headroom: ${headroom.headroomEtb} ETB`) as any; e.statusCode = 400; throw e; }
+  const d = await repo.findDistributorWithCredit(distId);
+  const lat = d?.lat ? Number(d.lat) : DEFAULT_LAT; const lng = d?.lng ? Number(d.lng) : DEFAULT_LNG;
+  const order = await repo.createOrderWithLines({
+    distributorId: distId, distributorName: profile.name, lat, lng,
+    weightKg: totals.totalWeightKg, volumeM3: totals.totalVolumeM3, totalQuantity: totals.totalQuantity,
+    lines: cartLines.map((c) => { const s = byId.get(c.skuId)!; return { skuId: c.skuId, skuCode: s.code, skuName: s.name, quantity: c.quantity, unitPrice: c.unitPrice, lineTotal: r2(c.quantity * c.unitPrice) }; }),
+  });
+  return { order_id: order.id, status: order.status, total_etb: totals.subtotalEtb, total_quantity: totals.totalQuantity, eta: null };
+}
+function mapStatus(oStatus: string, stopStatus: string | null | undefined): PortalOrderSummary['status'] {
+  if (oStatus === 'DELIVERED') return 'DELIVERED';
+  if (stopStatus === 'DELIVERED') return 'DELIVERED';
+  if (stopStatus === 'FAILED') return 'FAILED';
+  if (stopStatus) return 'ROUTED';
+  return 'PENDING';
+}
+export async function listOrders(distId: string): Promise<PortalOrdersResponse> {
+  const rows = await repo.findOrdersByDistributor(distId);
+  const active: PortalOrderSummary[] = []; const recent: PortalOrderSummary[] = [];
+  for (const o of rows) {
+    const total = o.lines.reduce((s, l) => s + Number(l.lineTotal), 0);
+    const stop = await repo.findRouteStopByOrderId(o.id);
+    const s: PortalOrderSummary = { order_id: o.id, status: mapStatus(o.status, stop?.status), created_at: o.createdAt.toISOString(), total_etb: r2(total), total_quantity: o.totalQuantity, line_count: o.lines.length, eta: stop ? stop.plannedEta.toISOString() : null, vehicle_id: stop?.routePlan.vehicleId ?? null, last_stop_status: stop?.status ?? null };
+    if (s.status === 'PENDING' || s.status === 'ROUTED') active.push(s); else recent.push(s);
+  }
+  return { active, recent };
+}
+export async function getOrderDetail(distId: string, orderId: string): Promise<PortalOrderDetail> {
+  const o = await repo.findOrderByIdAndDistributor(orderId, distId);
+  if (!o) { const e = new Error('order not found') as any; e.statusCode = 404; throw e; }
+  const stop = await repo.findRouteStopByOrderId(orderId);
+  return { order_id: o.id, status: mapStatus(o.status, stop?.status), created_at: o.createdAt.toISOString(), total_etb: r2(o.lines.reduce((s, l) => s + Number(l.lineTotal), 0)), total_quantity: o.totalQuantity, line_count: o.lines.length, eta: stop ? stop.plannedEta.toISOString() : null, vehicle_id: stop?.routePlan.vehicleId ?? null, driver_id: stop?.routePlan.driverId ?? null, route_stop_id: stop?.id ?? null, last_stop_status: stop?.status ?? null, lines: o.lines.map((l) => ({ sku_id: l.skuId, sku_code: l.skuCode, sku_name: l.skuName, quantity: l.quantity, unit_price_etb: Number(l.unitPrice), line_total_etb: Number(l.lineTotal) })) };
+}
+export async function getStatement(distId: string): Promise<StatementResponse> {
+  const d = await repo.findDistributorWithCredit(distId);
+  if (!d) { const e = new Error('distributor not found') as any; e.statusCode = 404; throw e; }
+  const a = d.creditAccounts[0];
+  const limit = a ? Number(a.limitEtb) : 0; const exposure = a ? Number(a.exposureEtb) : 0;
+  const oldest = a?.oldestUnpaidAt ?? null;
+  const days = oldest ? Math.floor((Date.now() - oldest.getTime()) / 86_400_000) : null;
+  const deliveries = await repo.findRecentDeliveries(distId, 10);
+  return { as_of: new Date().toISOString(), balance_etb: r2(exposure), limit_etb: r2(limit), grace_days: a?.graceDays ?? 14, days_since_oldest_unpaid: days, recent_payments: [], recent_deliveries: deliveries.map((s) => ({ order_id: s.orderId ?? s.id, delivered_at: s.statusUpdatedAt.toISOString(), total_quantity: s.quantityOrdered, vehicle_id: s.routePlan.vehicleId })) };
+}
+export async function raiseDispute(distId: string, input: RaiseDisputeRequest): Promise<DisputeRow> {
+  const o = await repo.findOrderByIdAndDistributor(input.order_id, distId);
+  if (!o) { const e = new Error('order not found for this distributor') as any; e.statusCode = 404; throw e; }
+  const proof = await repo.findLatestProofForOrder(input.order_id);
+  const d = await repo.createDispute({ orderId: input.order_id, distributorId: distId, type: input.type, description: input.description, proofId: proof?.id ?? null });
+  return { id: d.id, order_id: d.orderId, type: d.type as any, description: d.description, status: d.status as any, created_at: d.createdAt.toISOString(), resolution_notes: d.resolutionNotes };
+}
+export async function listDisputes(distId: string): Promise<{ disputes: DisputeRow[] }> {
+  const rows = await repo.findDisputes(distId);
+  return { disputes: rows.map((d) => ({ id: d.id, order_id: d.orderId, type: d.type as any, description: d.description, status: d.status as any, created_at: d.createdAt.toISOString(), resolution_notes: d.resolutionNotes })) };
+}
+EOF
+W services/api/src/modules/portal/context.ts <<'EOF'
+export function getDistributorId(req: any): string {
+  const id = req.headers['x-distributor-id'];
+  if (!id || typeof id !== 'string') { const e = new Error('X-Distributor-Id header required') as any; e.statusCode = 401; throw e; }
+  return id;
+}
+EOF
+W services/api/src/modules/portal/routes.ts <<'EOF'
+import type { FastifyPluginAsync } from 'fastify';
+import { PortalProfileSchema, CatalogResponseSchema, PlaceOrderRequestSchema, PlaceOrderResponseSchema, PortalOrdersResponseSchema, PortalOrderDetailSchema, StatementResponseSchema, RaiseDisputeRequestSchema, DisputesListResponseSchema } from '@tera/contracts';
+import * as s from './service.js';
+import { getDistributorId } from './context.js';
+export const portalRoutes: FastifyPluginAsync = async (app) => {
+  app.get('/me', { schema: { response: { 200: PortalProfileSchema as any } } }, async (req: any) => s.getProfile(getDistributorId(req)));
+  app.get('/catalog', { schema: { response: { 200: CatalogResponseSchema as any } } }, async () => s.getCatalog());
+  app.post('/orders', { schema: { body: PlaceOrderRequestSchema as any, response: { 200: PlaceOrderResponseSchema as any } } }, async (req: any) => s.placeOrder(getDistributorId(req), req.body));
+  app.get('/orders', { schema: { response: { 200: PortalOrdersResponseSchema as any } } }, async (req: any) => s.listOrders(getDistributorId(req)));
+  app.get('/orders/:id', { schema: { response: { 200: PortalOrderDetailSchema as any } } }, async (req: any) => s.getOrderDetail(getDistributorId(req), req.params.id));
+  app.get('/statements', { schema: { response: { 200: StatementResponseSchema as any } } }, async (req: any) => s.getStatement(getDistributorId(req)));
+  app.post('/disputes', { schema: { body: RaiseDisputeRequestSchema as any, response: { 200: DisputesListResponseSchema as any } } }, async (req: any) => { await s.raiseDispute(getDistributorId(req), req.body); return s.listDisputes(getDistributorId(req)); });
+  app.get('/disputes', { schema: { response: { 200: DisputesListResponseSchema as any } } }, async (req: any) => s.listDisputes(getDistributorId(req)));
+};
+EOF
+W services/api/src/modules/portal/index.ts <<'EOF'
+import type { FastifyPluginAsync } from 'fastify';
+import { portalRoutes } from './routes.js';
+export const portalPlugin: FastifyPluginAsync = async (app) => { await app.register(portalRoutes); };
+export default portalPlugin;
+EOF
+
+# ═══════════════════════════════════════════════════════════════════
+# PHASE 6d — BACKEND: AUDIT + NOTIFY
+# ═══════════════════════════════════════════════════════════════════
+echo "▸ Phase 6d — audit + notify backends"
+
+W services/api/src/modules/audit/repository.ts <<'EOF'
+import { db } from '@tera/db';
+export function findEntries(input: { entity?: string; actor?: string; limit: number }) {
+  return db().auditLog.findMany({ where: { ...(input.entity ? { entity: input.entity } : {}), ...(input.actor ? { actorId: input.actor } : {}) }, orderBy: { createdAt: 'desc' }, take: input.limit });
+}
+EOF
+W services/api/src/modules/audit/service.ts <<'EOF'
+import type { AuditListResponse, AuditLogEntry } from '@tera/contracts';
+import * as repo from './repository.js';
+export async function listAudit(input: { entity?: string; actor?: string; limit: number }): Promise<AuditListResponse> {
+  const rows = await repo.findEntries(input);
+  return { total: rows.length, entries: rows.map(toEntry) };
+}
+function toEntry(row: any): AuditLogEntry {
+  return { id: row.id, actor_id: row.actorId, entity: row.entity, entity_id: row.entityId, action: row.action, reason: row.reason, meta: row.metaJson as any, created_at: row.createdAt.toISOString() };
+}
+EOF
+W services/api/src/modules/audit/routes.ts <<'EOF'
+import type { FastifyPluginAsync } from 'fastify';
+import { AuditListResponseSchema } from '@tera/contracts';
+import * as s from './service.js';
+export const auditRoutes: FastifyPluginAsync = async (app) => {
+  app.get('/log', { schema: { response: { 200: AuditListResponseSchema as any } } }, async (req: any) => s.listAudit({ entity: req.query?.entity, actor: req.query?.actor, limit: req.query?.limit ? parseInt(req.query.limit, 10) : 100 }));
+};
+EOF
+W services/api/src/modules/audit/index.ts <<'EOF'
+import type { FastifyPluginAsync } from 'fastify';
+import { auditRoutes } from './routes.js';
+export const auditPlugin: FastifyPluginAsync = async (app) => { await app.register(auditRoutes); };
+export default auditPlugin;
+EOF
+
+W services/api/src/modules/notify/templates.ts <<'EOF'
+export interface NotificationTemplate { key: string; labelKey: string; channelHint: 'sms'|'telegram'|'email'|'any'; body: string; }
+export const TEMPLATES: NotificationTemplate[] = [
+  { key: 'test', labelKey: 'notify.template.test', channelHint: 'any', body: 'Tera OMS test notification at {time}. If you can read this, the {channel} adapter works.' },
+  { key: 'eta_alert', labelKey: 'notify.template.eta_alert', channelHint: 'sms', body: 'Hi {name}, your delivery {order_id} is on the way and should arrive around {eta}.' },
+  { key: 'order_confirmed', labelKey: 'notify.template.order_confirmed', channelHint: 'sms', body: 'Order {order_id} confirmed: {n} items, {total} ETB.' },
+  { key: 'delivery_completed', labelKey: 'notify.template.delivery_completed', channelHint: 'sms', body: 'Delivery {order_id} completed at {time}.' },
+];
+export const findTemplate = (k: string) => TEMPLATES.find((t) => t.key === k) ?? null;
+export function renderTemplate(body: string, vars: Record<string, string>): string {
+  return body.replace(/\{(\w+)\}/g, (_, k) => (k in vars ? vars[k]! : `{${k}}`));
+}
+EOF
+W services/api/src/modules/notify/adapters.ts <<'EOF'
+export type Channel = 'sms' | 'telegram' | 'email';
+export interface SendResult { ok: boolean; providerRef: string | null; error: string | null; stub: boolean; }
+function fakeRef(p: string) { return `${p}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`; }
+async function sendSms(r: string, b: string): Promise<SendResult> { console.log(`[SMS STUB] → ${r}\n  ${b}`); return { ok: true, providerRef: fakeRef('sms'), error: null, stub: true }; }
+async function sendTg(r: string, b: string): Promise<SendResult> { console.log(`[TELEGRAM STUB] → ${r}\n  ${b}`); return { ok: true, providerRef: fakeRef('tg'), error: null, stub: true }; }
+async function sendEmail(r: string, b: string): Promise<SendResult> { console.log(`[EMAIL STUB] → ${r}\n  ${b}`); return { ok: true, providerRef: fakeRef('email'), error: null, stub: true }; }
+export async function sendViaChannel(c: Channel, r: string, b: string): Promise<SendResult> {
+  switch (c) { case 'sms': return sendSms(r, b); case 'telegram': return sendTg(r, b); case 'email': return sendEmail(r, b); }
+}
+EOF
+W services/api/src/modules/notify/repository.ts <<'EOF'
+import { db } from '@tera/db';
+export const createLog = (i: any) => db().notificationLog.create({ data: i });
+export function findLogs(input: { channel?: string; status?: string; limit: number }) {
+  return db().notificationLog.findMany({ where: { ...(input.channel ? { channel: input.channel } : {}), ...(input.status ? { status: input.status } : {}) }, orderBy: { sentAt: 'desc' }, take: input.limit });
+}
+EOF
+W services/api/src/modules/notify/service.ts <<'EOF'
+import type { NotificationLogEntry, NotificationListResponse, SendNotificationRequest, SendNotificationResponse, TestSendRequest } from '@tera/contracts';
+import * as repo from './repository.js';
+import { TEMPLATES, findTemplate, renderTemplate } from './templates.js';
+import { sendViaChannel, type Channel } from './adapters.js';
+import { writeAudit } from '../../core/audit.js';
+export async function sendNotification(input: SendNotificationRequest, actorId: string): Promise<SendNotificationResponse> {
+  const t = findTemplate(input.template_key);
+  if (!t) { const e = new Error(`unknown template "${input.template_key}"`) as any; e.statusCode = 400; throw e; }
+  const body = renderTemplate(t.body, { ...input.vars, channel: input.channel });
+  let r; try { r = await sendViaChannel(input.channel as Channel, input.recipient, body); } catch (err) { r = { ok: false, providerRef: null, error: err instanceof Error ? err.message : String(err), stub: true }; }
+  const status = r.ok ? (r.stub ? 'STUB' : 'SENT') : 'FAILED';
+  const log = await repo.createLog({ channel: input.channel, recipient: input.recipient, templateKey: input.template_key, renderedBody: body, status, providerRef: r.providerRef, error: r.error });
+  await writeAudit({ actorId, entity: 'notification', entityId: log.id, action: 'sent', reason: `${input.channel} → ${input.recipient} (${input.template_key})`, meta: { status, providerRef: r.providerRef } });
+  return { id: log.id, status: status as any, provider_ref: r.providerRef };
+}
+export async function sendTest(input: TestSendRequest, actorId: string) {
+  return sendNotification({ channel: input.channel, recipient: input.recipient, template_key: 'test', vars: { time: new Date().toLocaleString(), channel: input.channel } }, actorId);
+}
+export async function listNotifications(input: { channel?: string; status?: string; limit: number }): Promise<NotificationListResponse> {
+  const rows = await repo.findLogs(input);
+  return { total: rows.length, entries: rows.map((r) => ({ id: r.id, channel: r.channel as any, recipient: r.recipient, template_key: r.templateKey, rendered_body: r.renderedBody, status: r.status as any, provider_ref: r.providerRef, error: r.error, sent_at: r.sentAt.toISOString() })) };
+}
+export function listTemplates() { return { templates: TEMPLATES.map((t) => ({ key: t.key, label_key: t.labelKey, channel_hint: t.channelHint })) }; }
+EOF
+W services/api/src/modules/notify/routes.ts <<'EOF'
+import type { FastifyPluginAsync } from 'fastify';
+import { NotificationListResponseSchema, SendNotificationRequestSchema, SendNotificationResponseSchema, TestSendRequestSchema } from '@tera/contracts';
+import * as s from './service.js';
+export const notifyRoutes: FastifyPluginAsync = async (app) => {
+  app.get('/log', { schema: { response: { 200: NotificationListResponseSchema as any } } }, async (req: any) => s.listNotifications({ channel: req.query?.channel, status: req.query?.status, limit: req.query?.limit ? parseInt(req.query.limit, 10) : 100 }));
+  app.get('/templates', async () => s.listTemplates());
+  app.post('/send', { schema: { body: SendNotificationRequestSchema as any, response: { 200: SendNotificationResponseSchema as any } } }, async (req: any) => s.sendNotification(req.body, req.user?.sub ?? 'admin'));
+  app.post('/test', { schema: { body: TestSendRequestSchema as any, response: { 200: SendNotificationResponseSchema as any } } }, async (req: any) => s.sendTest(req.body, req.user?.sub ?? 'admin'));
+};
+EOF
+W services/api/src/modules/notify/index.ts <<'EOF'
+import type { FastifyPluginAsync } from 'fastify';
+import { notifyRoutes } from './routes.js';
+export const notifyPlugin: FastifyPluginAsync = async (app) => { await app.register(notifyRoutes); };
+export default notifyPlugin;
+EOF
+
+# ═══════════════════════════════════════════════════════════════════
+# PHASE 6e — BACKEND: ADMIN JOBS + MONITORING
+# ═══════════════════════════════════════════════════════════════════
+echo "▸ Phase 6e — admin/jobs + monitoring backends"
+
+W services/api/src/modules/admin/jobs/queue.ts <<'EOF'
+import { Queue } from 'bullmq';
+import IORedis from 'ioredis';
+const NAME = 'worker-jobs';
+let redis: IORedis | null = null; let q: Queue | null = null;
+function getRedis() { if (!redis) { redis = new IORedis(process.env.REDIS_URL ?? 'redis://localhost:6379', { maxRetriesPerRequest: null, enableReadyCheck: false }); } return redis; }
+export function getQueue(): Queue { if (!q) q = new Queue(NAME, { connection: getRedis() }); return q; }
+export async function enqueueJob(jobKey: string, triggeredBy: string): Promise<void> {
+  await getQueue().add(jobKey, { triggeredBy }, { removeOnComplete: { age: 3600, count: 100 }, removeOnFail: { age: 86_400, count: 100 } });
+}
+EOF
+W services/api/src/modules/admin/jobs/repository.ts <<'EOF'
+import { db } from '@tera/db';
+export const findRecentRuns = (limit: number) => db().jobRun.findMany({ orderBy: { startedAt: 'desc' }, take: limit });
+export const findLatestForJob = (jobKey: string) => db().jobRun.findFirst({ where: { jobKey }, orderBy: { startedAt: 'desc' } });
+EOF
+W services/api/src/modules/admin/jobs/service.ts <<'EOF'
+import type { JobRun, JobRunsResponse, JobScheduleEntry, JobScheduleResponse, JobKey } from '@tera/contracts';
+import * as repo from './repository.js';
+import { enqueueJob } from './queue.js';
+const SCHEDULE: { key: JobKey; labelKey: string; schedule: string }[] = [
+  { key: 'metric_snapshot', labelKey: 'jobs.job.metric_snapshot', schedule: '0 22 * * *' },
+  { key: 'credit_rebuild', labelKey: 'jobs.job.credit_rebuild', schedule: '15 22 * * *' },
+  { key: 'fuel_variance', labelKey: 'jobs.job.fuel_variance', schedule: '30 22 * * *' },
+];
+export async function listRuns(limit = 50): Promise<JobRunsResponse> {
+  const rows = await repo.findRecentRuns(limit);
+  return { total: rows.length, runs: rows.map(toRun) };
+}
+export async function listSchedule(): Promise<JobScheduleResponse> {
+  const jobs: JobScheduleEntry[] = [];
+  for (const s of SCHEDULE) {
+    const last = await repo.findLatestForJob(s.key);
+    jobs.push({ job_key: s.key, label_key: s.labelKey, schedule: s.schedule, next_run_at: computeNextRun(s.schedule), last_run: last ? toRun(last) : null });
+  }
+  return { jobs };
+}
+export async function runNow(key: JobKey, actorId: string): Promise<void> { await enqueueJob(key, `manual:${actorId}`); }
+function toRun(row: any): JobRun {
+  return { id: row.id, job_key: row.jobKey, status: row.status, started_at: row.startedAt.toISOString(), finished_at: row.finishedAt?.toISOString() ?? null, duration_ms: row.durationMs, processed_count: row.processedCount, skipped_count: row.skippedCount, triggered_by: row.triggeredBy, error: row.error };
+}
+function computeNextRun(cronExpr: string): string | null {
+  const p = cronExpr.split(' '); if (p.length < 2) return null;
+  const m = parseInt(p[0]!, 10); const h = parseInt(p[1]!, 10); if (!Number.isFinite(m) || !Number.isFinite(h)) return null;
+  const now = new Date(); const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), h, m, 0));
+  if (next.getTime() <= now.getTime()) next.setUTCDate(next.getUTCDate() + 1);
+  return next.toISOString();
+}
+EOF
+W services/api/src/modules/admin/jobs/routes.ts <<'EOF'
+import type { FastifyPluginAsync } from 'fastify';
+import { JobRunsResponseSchema, JobScheduleResponseSchema, RunJobResponseSchema, JobKeyEnum } from '@tera/contracts';
+import * as s from './service.js';
+export const adminJobsRoutes: FastifyPluginAsync = async (app) => {
+  app.get('/runs', { schema: { response: { 200: JobRunsResponseSchema as any } } }, async (req: any) => s.listRuns(req.query?.limit ? parseInt(req.query.limit, 10) : 50));
+  app.get('/schedule', { schema: { response: { 200: JobScheduleResponseSchema as any } } }, async () => s.listSchedule());
+  app.post('/:key/run', { schema: { response: { 200: RunJobResponseSchema as any } } }, async (req: any) => {
+    const key = JobKeyEnum.parse(req.params.key); await s.runNow(key, req.user?.sub ?? 'admin'); return { job_key: key, enqueued: true as const };
+  });
+};
+EOF
+W services/api/src/modules/admin/jobs/index.ts <<'EOF'
+import type { FastifyPluginAsync } from 'fastify';
+import { adminJobsRoutes } from './routes.js';
+export const adminJobsPlugin: FastifyPluginAsync = async (app) => { await app.register(adminJobsRoutes); };
+export default adminJobsPlugin;
+EOF
+
+# Monitoring
+W services/api/src/modules/monitoring/histogram.ts <<'EOF'
+export interface HistogramState { counts: number[]; sum: number; count: number; }
+export const emptyHistogram = (buckets: number[]): HistogramState => ({ counts: new Array(buckets.length).fill(0), sum: 0, count: 0 });
+export function observeHistogram(s: HistogramState, buckets: number[], v: number): void {
+  s.sum += v; s.count += 1;
+  for (let i = 0; i < buckets.length; i++) if (v <= buckets[i]!) s.counts[i]! += 1;
+}
+export function computeQuantileFromValues(values: number[], q: number): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  return sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))]!;
+}
+EOF
+W services/api/src/modules/monitoring/metrics-state.ts <<'EOF'
+import { emptyHistogram, observeHistogram, type HistogramState } from './histogram.js';
+export const HTTP_BUCKETS = [0.01, 0.05, 0.1, 0.5, 1, 5];
+export const httpCounters = new Map<string, number>();
+export const httpHistograms = new Map<string, HistogramState>();
+export function recordHttpRequest(method: string, route: string, status: string, dur: number): void {
+  const key = `${method}|${route}|${status}`;
+  httpCounters.set(key, (httpCounters.get(key) ?? 0) + 1);
+  let h = httpHistograms.get(route);
+  if (!h) { h = emptyHistogram(HTTP_BUCKETS); httpHistograms.set(route, h); }
+  observeHistogram(h, HTTP_BUCKETS, dur);
+}
+export function httpTotals() { let t = 0, s5 = 0; for (const [k, v] of httpCounters) { t += v; if ((k.split('|')[2] ?? '').startsWith('5')) s5 += v; } return { total: t, s5xx: s5 }; }
+export function _reset() { httpCounters.clear(); httpHistograms.clear(); }
+EOF
+W services/api/src/modules/monitoring/middleware.ts <<'EOF'
+import type { FastifyReply, FastifyRequest } from 'fastify';
+import { recordHttpRequest } from './metrics-state.js';
+const SKIP = new Set(['/metrics', '/health']);
+interface Tagged extends FastifyRequest { _startNs?: bigint; }
+export async function onRequestHook(req: Tagged) { req._startNs = process.hrtime.bigint(); }
+export async function onResponseHook(req: Tagged, reply: FastifyReply) {
+  const start = req._startNs; if (!start) return;
+  const route = req.routeOptions.url; if (!route || SKIP.has(route)) return;
+  recordHttpRequest(req.method, route, String(reply.statusCode), Number(process.hrtime.bigint() - start) / 1e9);
+}
+EOF
+W services/api/src/modules/monitoring/prometheus-format.ts <<'EOF'
+export interface Sample { labels: Record<string, string>; value: number; }
+export interface Metric { name: string; help: string; type: 'counter' | 'gauge'; samples: Sample[]; }
+export function renderPrometheus(metrics: Metric[]): string {
+  const lines: string[] = []; const seen = new Set<string>();
+  for (const m of metrics) {
+    if (m.samples.length === 0) continue;
+    if (!seen.has(m.name)) { lines.push(`# HELP ${m.name} ${m.help}`); lines.push(`# TYPE ${m.name} ${m.type}`); seen.add(m.name); }
+    for (const s of m.samples) lines.push(`${m.name}${labels(s.labels)} ${num(s.value)}`);
+  }
+  return lines.join('\n') + '\n';
+}
+export interface HistSeries { labels: Record<string, string>; bounds: number[]; cumulative: number[]; total: number; sum: number; }
+export function renderHistogram(name: string, help: string, series: HistSeries[]): string {
+  const lines = [`# HELP ${name} ${help}`, `# TYPE ${name} histogram`];
+  for (const s of series) {
+    for (let i = 0; i < s.bounds.length; i++) lines.push(`${name}_bucket${labels({ ...s.labels, le: String(s.bounds[i]) })} ${s.cumulative[i]}`);
+    lines.push(`${name}_bucket${labels({ ...s.labels, le: '+Inf' })} ${s.total}`);
+    lines.push(`${name}_sum${labels(s.labels)} ${num(s.sum)}`);
+    lines.push(`${name}_count${labels(s.labels)} ${s.total}`);
+  }
+  return lines.join('\n') + '\n';
+}
+function labels(l: Record<string, string>): string {
+  const k = Object.keys(l); if (k.length === 0) return '';
+  return `{${k.map((x) => `${x}="${l[x]!.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`).join(',')}}`;
+}
+function num(n: number): string { if (Number.isNaN(n)) return 'NaN'; if (!Number.isFinite(n)) return n > 0 ? '+Inf' : '-Inf'; return String(n); }
+EOF
+W services/api/src/modules/monitoring/db-gauges.ts <<'EOF'
+import { computeQuantileFromValues } from './histogram.js';
+import type { Metric } from './prometheus-format.js';
+export interface Input {
+  solveJobs: { status: string; count: number }[];
+  solveDurationsMs: number[];
+  pendingOrders: number; unreconciledPayments: number;
+  staleSyncClients: number; highVarianceFuelLogs7d: number;
+  jobRuns24h: { jobKey: string; status: string; count: number }[];
+}
+export function buildDbGauges(i: Input): Metric[] {
+  const out: Metric[] = [];
+  out.push({ name: 'tera_solve_jobs', help: 'Current solve jobs by status', type: 'gauge', samples: i.solveJobs.map((r) => ({ labels: { status: r.status }, value: r.count })) });
+  if (i.solveDurationsMs.length > 0) {
+    const avg = i.solveDurationsMs.reduce((s, x) => s + x, 0) / i.solveDurationsMs.length;
+    const p95 = computeQuantileFromValues(i.solveDurationsMs, 0.95);
+    out.push({ name: 'tera_solve_job_duration_seconds', help: 'Solve job duration', type: 'gauge', samples: [
+      { labels: { quantile: 'avg' }, value: Math.round(avg / 10) / 100 },
+      { labels: { quantile: 'p95' }, value: Math.round(p95 / 10) / 100 },
+    ]});
+  }
+  out.push({ name: 'tera_pending_orders', help: 'Orders PENDING', type: 'gauge', samples: [{ labels: {}, value: i.pendingOrders }] });
+  out.push({ name: 'tera_unreconciled_payments', help: 'Payments awaiting reconcile', type: 'gauge', samples: [{ labels: {}, value: i.unreconciledPayments }] });
+  out.push({ name: 'tera_stale_sync_clients', help: 'Sync clients stale > 1h', type: 'gauge', samples: [{ labels: {}, value: i.staleSyncClients }] });
+  out.push({ name: 'tera_high_variance_fuel_logs_7d', help: 'High-variance fuel last 7d', type: 'gauge', samples: [{ labels: {}, value: i.highVarianceFuelLogs7d }] });
+  out.push({ name: 'tera_job_runs_24h', help: 'Job runs last 24h', type: 'gauge', samples: i.jobRuns24h.map((r) => ({ labels: { job: r.jobKey, status: r.status }, value: r.count })) });
+  return out;
+}
+EOF
+W services/api/src/modules/monitoring/repository.ts <<'EOF'
+import { db } from '@tera/db';
+export async function loadSolveJobsByStatus() { const r = await db().solveJob.groupBy({ by: ['status'], _count: { _all: true } }); return r.map((x) => ({ status: x.status, count: x._count._all })); }
+export async function loadRecentDurations() { const r = await db().solveJob.findMany({ where: { status: 'DONE', durationMs: { not: null } }, select: { durationMs: true }, orderBy: { createdAt: 'desc' }, take: 100 }); return r.map((x) => x.durationMs!).filter(Number.isFinite); }
+export const countPending = () => db().order.count({ where: { status: 'PENDING' } });
+export const countUnreconciled = () => db().payment.count({ where: { reconciledAt: null } });
+export function countStaleClients(h: number) { return db().syncClient.count({ where: { lastSeenAt: { lt: new Date(Date.now() - h * 3600_000) } } }); }
+export function countHighVarFuel(d: number) { return db().fuelLog.count({ where: { varianceFlag: 'HIGH', capturedAt: { gte: new Date(Date.now() - d * 86_400_000) } } }); }
+export async function loadJobRuns24h() { const r = await db().jobRun.groupBy({ by: ['jobKey', 'status'], where: { startedAt: { gte: new Date(Date.now() - 24 * 3600_000) } }, _count: { _all: true } }); return r.map((x) => ({ jobKey: x.jobKey, status: x.status, count: x._count._all })); }
+EOF
+W services/api/src/modules/monitoring/service.ts <<'EOF'
+import { httpCounters, httpHistograms, httpTotals, HTTP_BUCKETS } from './metrics-state.js';
+import { renderPrometheus, renderHistogram, type Metric, type HistSeries } from './prometheus-format.js';
+import { buildDbGauges } from './db-gauges.js';
+import * as repo from './repository.js';
+const START = Date.now();
+export async function getMetricsText(): Promise<string> {
+  const metrics: Metric[] = [];
+  const c: { labels: Record<string, string>; value: number }[] = [];
+  for (const [k, v] of httpCounters) { const [m, r, s] = k.split('|'); c.push({ labels: { method: m!, route: r!, status: s! }, value: v }); }
+  metrics.push({ name: 'tera_http_requests_total', help: 'Total HTTP requests', type: 'counter', samples: c });
+  metrics.push(...buildDbGauges({
+    solveJobs: await repo.loadSolveJobsByStatus(),
+    solveDurationsMs: await repo.loadRecentDurations(),
+    pendingOrders: await repo.countPending(),
+    unreconciledPayments: await repo.countUnreconciled(),
+    staleSyncClients: await repo.countStaleClients(1),
+    highVarianceFuelLogs7d: await repo.countHighVarFuel(7),
+    jobRuns24h: await repo.loadJobRuns24h(),
+  }));
+  const mem = process.memoryUsage();
+  metrics.push({ name: 'tera_process_uptime_seconds', help: 'Uptime', type: 'gauge', samples: [{ labels: {}, value: Math.round((Date.now() - START) / 1000) }] });
+  metrics.push({ name: 'tera_process_memory_bytes', help: 'Memory', type: 'gauge', samples: [
+    { labels: { type: 'rss' }, value: mem.rss }, { labels: { type: 'heap_used' }, value: mem.heapUsed }, { labels: { type: 'heap_total' }, value: mem.heapTotal },
+  ]});
+  let out = renderPrometheus(metrics);
+  const hs: HistSeries[] = [];
+  for (const [route, s] of httpHistograms) if (s.count > 0) hs.push({ labels: { route }, bounds: HTTP_BUCKETS, cumulative: s.counts, total: s.count, sum: s.sum });
+  if (hs.length > 0) out += renderHistogram('tera_http_request_duration_seconds', 'HTTP duration', hs);
+  return out;
+}
+export function getUptimeSeconds() { return Math.round((Date.now() - START) / 1000); }
+export function getHttpTotals() { return httpTotals(); }
+EOF
+W services/api/src/modules/monitoring/snapshot-service.ts <<'EOF'
+import type { MonitoringSnapshot } from '@tera/contracts';
+import { computeQuantileFromValues } from './histogram.js';
+import { httpTotals } from './metrics-state.js';
+import { getUptimeSeconds } from './service.js';
+import * as repo from './repository.js';
+export async function getSnapshot(): Promise<MonitoringSnapshot> {
+  const [solveJobs, durations, pending, unrecon, stale, highFuel, jobRuns] = await Promise.all([
+    repo.loadSolveJobsByStatus(), repo.loadRecentDurations(), repo.countPending(),
+    repo.countUnreconciled(), repo.countStaleClients(1), repo.countHighVarFuel(7), repo.loadJobRuns24h(),
+  ]);
+  const { total, s5xx } = httpTotals();
+  const byStatus: Record<string, number> = {}; for (const s of solveJobs) byStatus[s.status] = s.count;
+  const avg = durations.length > 0 ? durations.reduce((s, x) => s + x, 0) / durations.length : 0;
+  const p95 = computeQuantileFromValues(durations, 0.95);
+  return {
+    as_of: new Date().toISOString(), uptime_seconds: getUptimeSeconds(),
+    http_requests_total: total, http_5xx_total: s5xx, http_error_rate_pct: total > 0 ? Math.round((s5xx / total) * 10000) / 100 : 0,
+    solve_jobs_by_status: byStatus, solve_duration_avg_ms: Math.round(avg), solve_duration_p95_ms: Math.round(p95),
+    pending_orders: pending, unreconciled_payments: unrecon, stale_sync_clients: stale, high_variance_fuel_logs_7d: highFuel,
+    job_runs_24h: jobRuns.map((r) => ({ job: r.jobKey, status: r.status, count: r.count })),
+  };
+}
+EOF
+W services/api/src/modules/monitoring/routes.ts <<'EOF'
+import type { FastifyPluginAsync } from 'fastify';
+import { MonitoringSnapshotSchema } from '@tera/contracts';
+import * as s from './service.js';
+import * as snap from './snapshot-service.js';
+export const monitoringRoutes: FastifyPluginAsync = async (app) => {
+  app.get('/metrics', async (_req, reply) => { const b = await s.getMetricsText(); reply.header('Content-Type', 'text/plain; version=0.0.4'); return b; });
+  app.get('/admin/monitoring/v1/snapshot', { schema: { response: { 200: MonitoringSnapshotSchema as any } } }, async () => snap.getSnapshot());
+};
+EOF
+W services/api/src/modules/monitoring/index.ts <<'EOF'
+import type { FastifyPluginAsync } from 'fastify';
+import { monitoringRoutes } from './routes.js';
+export const monitoringPlugin: FastifyPluginAsync = async (app) => { await app.register(monitoringRoutes); };
+export default monitoringPlugin;
+EOF
+
+# ═══════════════════════════════════════════════════════════════════
+# UPDATE API — register all new modules + monitoring hooks
+# ═══════════════════════════════════════════════════════════════════
+W services/api/src/app.ts <<'EOF'
+import Fastify from 'fastify';
+import cors from '@fastify/cors';
+import sensible from '@fastify/sensible';
+import swagger from '@fastify/swagger';
+import swaggerUi from '@fastify/swagger-ui';
+import { errorHandler } from './plugins/errorHandler.js';
+import { authPlugin } from './plugins/auth.js';
+import { onRequestHook, onResponseHook } from './modules/monitoring/middleware.js';
+
+import credit from './modules/credit/index.js';
+import configMod from './modules/config/index.js';
+import geo from './modules/geo/index.js';
+import routing from './modules/routing/index.js';
+import orders from './modules/orders/index.js';
+import dispatch from './modules/dispatch/index.js';
+import masterdata from './modules/masterdata/index.js';
+import analytics from './modules/analytics/index.js';
+import payments from './modules/payments/index.js';
+import portal from './modules/portal/index.js';
+import audit from './modules/audit/index.js';
+import notify from './modules/notify/index.js';
+import adminJobs from './modules/admin/jobs/index.js';
+import monitoring from './modules/monitoring/index.js';
+
+export async function buildApp() {
+  const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? 'info' } });
+  await app.register(cors, { origin: true });
+  app.addHook('onRequest', onRequestHook);
+  app.addHook('onResponse', onResponseHook);
+  await app.register(sensible);
+  await app.register(swagger, { openapi: { info: { title: 'Tera OMS API', version: '0.1.0' } } });
+  await app.register(swaggerUi, { routePrefix: '/docs' });
+  app.setErrorHandler(errorHandler);
+  await app.register(authPlugin);
+
+  await app.register(configMod,  { prefix: '/config/v1' });
+  await app.register(credit,     { prefix: '/credit/v1' });
+  await app.register(geo,        { prefix: '/geo/v1' });
+  await app.register(routing,    { prefix: '/routing/v1' });
+  await app.register(orders,     { prefix: '/orders/v1' });
+  await app.register(dispatch,   { prefix: '/dispatch/v1' });
+  await app.register(masterdata, { prefix: '/masterdata/v1' });
+  await app.register(analytics,  { prefix: '/analytics/v1' });
+  await app.register(payments,   { prefix: '/payments/v1' });
+  await app.register(portal,     { prefix: '/portal/v1' });
+  await app.register(audit,      { prefix: '/audit/v1' });
+  await app.register(notify,     { prefix: '/notify/v1' });
+  await app.register(adminJobs,  { prefix: '/admin/jobs/v1' });
+  await app.register(monitoring);
+
+  app.get('/health', async () => ({ ok: true }));
+  return app;
+}
+EOF
+
+# ═══════════════════════════════════════════════════════════════════
+# OPTIMIZER SERVICE (VRP worker — BullMQ consumer)
+# ═══════════════════════════════════════════════════════════════════
+echo "▸ Optimizer service"
+
+W services/optimizer/package.json <<'EOF'
+{
+  "name": "@tera/optimizer", "version": "0.1.0", "private": true, "type": "module",
+  "scripts": { "dev": "tsx watch src/main.ts", "build": "tsc -b", "start": "node dist/main.js", "lint": "tsc --noEmit", "test": "vitest run" },
+  "dependencies": { "@tera/db": "workspace:*", "@tera/solver": "workspace:*", "bullmq": "^5.8.0", "ioredis": "^5.4.0", "pino": "^9.0.0" },
+  "devDependencies": { "@types/node": "^20.12.0", "tsx": "^4.7.0", "typescript": "^5.4.0", "vitest": "^1.6.0" }
+}
+EOF
+W services/optimizer/tsconfig.json <<'EOF'
+{ "extends": "../../tsconfig.base.json", "compilerOptions": { "outDir": "dist", "rootDir": "src", "composite": true, "noEmit": false }, "include": ["src"] }
+EOF
+W services/optimizer/vitest.config.ts <<'EOF'
+import { defineConfig } from 'vitest/config';
+export default defineConfig({ test: { environment: 'node', globals: true } });
+EOF
+W services/optimizer/Dockerfile <<'EOF'
+FROM node:20-alpine
+WORKDIR /app
+RUN corepack enable
+COPY package.json ./
+RUN pnpm install --prod=false
+COPY src ./src
+CMD ["pnpm", "tsx", "src/main.ts"]
+EOF
+W services/optimizer/src/solver-worker.ts <<'EOF'
+import { db } from '@tera/db';
+import { solve } from '@tera/solver';
+const MAX = 500;
+export async function processSolveJob(dbJobId: string): Promise<void> {
+  const job = await db().solveJob.findUnique({ where: { id: dbJobId } });
+  if (!job) throw new Error(`solve job ${dbJobId} not found`);
+  if (job.status !== 'QUEUED') { console.log(`[opt] ${dbJobId} already ${job.status} — skip`); return; }
+  const startedAt = new Date();
+  await db().solveJob.update({ where: { id: dbJobId }, data: { status: 'RUNNING', startedAt } });
+  try {
+    const ids = job.orderIdsJson as string[];
+    if (!Array.isArray(ids) || ids.length < 2) throw new Error('need ≥2 orders');
+    if (ids.length > MAX) throw new Error(`too many (${ids.length})`);
+    const [orders, vehicle, zones] = await Promise.all([
+      db().order.findMany({ where: { id: { in: ids } } }),
+      db().vehicle.findUnique({ where: { id: job.vehicleId } }),
+      db().curfewZone.findMany({ where: { active: true } }),
+    ]);
+    if (!vehicle) throw new Error(`vehicle ${job.vehicleId} not found`);
+    if (orders.length < 2) throw new Error('fewer than 2 valid orders');
+    const result = solve(
+      orders.map((o) => ({ id: o.id, distributor_name: o.distributorName, lat: Number(o.lat), lng: Number(o.lng), weight_kg: Number(o.weightKg), volume_m3: Number(o.volumeM3), priority: o.priority, time_window_start: o.timeWindowStart.toISOString(), time_window_end: o.timeWindowEnd.toISOString() })),
+      { id: vehicle.id, lat: Number(vehicle.startLat), lng: Number(vehicle.startLng), capacity_kg: Number(vehicle.capacityKg), capacity_m3: Number(vehicle.capacityM3), shift_start_h: vehicle.shiftStartH, shift_end_h: vehicle.shiftEndH },
+      { curfew_zones: zones.map((z) => ({ id: z.id, name: z.name, polygon: z.polygonJson as any, start_hour: z.startHour, end_hour: z.endHour })) },
+    );
+    const finishedAt = new Date();
+    await db().solveJob.update({ where: { id: dbJobId }, data: { status: 'DONE', resultJson: result as any, finishedAt, durationMs: finishedAt.getTime() - startedAt.getTime() } });
+  } catch (err) {
+    const finishedAt = new Date();
+    const msg = err instanceof Error ? err.message : String(err);
+    await db().solveJob.update({ where: { id: dbJobId }, data: { status: 'FAILED', error: msg, finishedAt, durationMs: finishedAt.getTime() - startedAt.getTime() } });
+    throw err;
+  }
+}
+EOF
+W services/optimizer/src/main.ts <<'EOF'
+import { Worker, type Job } from 'bullmq';
+import IORedis from 'ioredis';
+import { processSolveJob } from './solver-worker.js';
+
+const QUEUE = 'route-solve'; const CONCURRENCY = Number(process.env.OPT_CONCURRENCY ?? 2);
+const redis = new IORedis(process.env.REDIS_URL ?? 'redis://localhost:6379', { maxRetriesPerRequest: null, enableReadyCheck: false });
+redis.on('connect', () => console.log('[opt] redis connected'));
+redis.on('error', (e) => console.error('[opt] redis error', e.message));
+
+const worker = new Worker<{ dbJobId: string }>(QUEUE, async (job: Job<{ dbJobId: string }>) => {
+  console.log(`[opt] picked ${job.id}`);
+  await processSolveJob(job.data.dbJobId);
+  console.log(`[opt] finished ${job.id}`);
+}, { connection: redis, concurrency: CONCURRENCY });
+
+worker.on('completed', (j) => console.log(`[opt] ✓ ${j.id}`));
+worker.on('failed', (j, e) => console.error(`[opt] ✗ ${j?.id}: ${e.message}`));
+
+console.log(`[opt] ready · queue=${QUEUE} concurrency=${CONCURRENCY}`);
+process.on('SIGTERM', async () => { await worker.close(); await redis.quit(); process.exit(0); });
+process.on('SIGINT', async () => { await worker.close(); await redis.quit(); process.exit(0); });
+EOF
+W services/optimizer/src/__tests__/state.test.ts <<'EOF'
+import { describe, it, expect } from 'vitest';
+type S = 'QUEUED' | 'RUNNING' | 'DONE' | 'FAILED' | 'TIMEOUT';
+const shouldProcess = (s: S) => s === 'QUEUED';
+describe('solve job state', () => { it('only QUEUED jobs are processed', () => {
+  expect(shouldProcess('QUEUED')).toBe(true);
+  expect(shouldProcess('RUNNING')).toBe(false);
+  expect(shouldProcess('DONE')).toBe(false);
+}); });
+EOF
+
+# ═══════════════════════════════════════════════════════════════════
+# WORKER SERVICE (nightly jobs)
+# ═══════════════════════════════════════════════════════════════════
+echo "▸ Worker service"
+
+W services/worker/package.json <<'EOF'
+{
+  "name": "@tera/worker", "version": "0.1.0", "private": true, "type": "module",
+  "scripts": { "dev": "tsx watch src/main.ts", "build": "tsc -b", "start": "node dist/main.js", "lint": "tsc --noEmit", "test": "vitest run" },
+  "dependencies": { "@tera/db": "workspace:*", "bullmq": "^5.8.0", "ioredis": "^5.4.0", "node-cron": "^3.0.3", "pino": "^9.0.0" },
+  "devDependencies": { "@types/node": "^20.12.0", "@types/node-cron": "^3.0.11", "tsx": "^4.7.0", "typescript": "^5.4.0", "vitest": "^1.6.0" }
+}
+EOF
+W services/worker/tsconfig.json <<'EOF'
+{ "extends": "../../tsconfig.base.json", "compilerOptions": { "outDir": "dist", "rootDir": "src", "composite": true, "noEmit": false }, "include": ["src"] }
+EOF
+W services/worker/vitest.config.ts <<'EOF'
+import { defineConfig } from 'vitest/config';
+export default defineConfig({ test: { environment: 'node', globals: true } });
+EOF
+W services/worker/Dockerfile <<'EOF'
+FROM node:20-alpine
+WORKDIR /app
+RUN corepack enable
+COPY package.json ./
+RUN pnpm install --prod=false
+COPY src ./src
+CMD ["pnpm", "tsx", "src/main.ts"]
+EOF
+W services/worker/src/jobs/repository.ts <<'EOF'
+import { db } from '@tera/db';
+export const createJobRun = (k: string, t: string) => db().jobRun.create({ data: { jobKey: k, triggeredBy: t, status: 'RUNNING' } });
+export async function finishJobRun(id: string, i: { status: string; processedCount: number; skippedCount: number; error?: string | null }) {
+  const fin = new Date();
+  const row = await db().jobRun.update({ where: { id }, data: { status: i.status, finishedAt: fin, processedCount: i.processedCount, skippedCount: i.skippedCount, error: i.error ?? null } });
+  await db().jobRun.update({ where: { id }, data: { durationMs: fin.getTime() - row.startedAt.getTime() } });
+}
+export const upsertSnapshot = (date: Date, key: string, value: number) => db().metricSnapshot.upsert({ where: { date_key: { date, key } }, create: { date, key, value }, update: { value } });
+export const loadAssumptions = () => db().costAssumption.findMany();
+export const loadActiveVehicles = () => db().vehicle.findMany({ where: { active: true, baselineLPer100Km: { not: null } } });
+export const loadFuelFillsForVehicle = (id: string, since: Date) => db().fuelLog.findMany({ where: { vehicleId: id, capturedAt: { gte: since } }, select: { liters: true, odometerKm: true, capturedAt: true }, orderBy: { capturedAt: 'asc' } });
+export const loadAllCreditAccounts = () => db().creditAccount.findMany();
+export const loadUnreconciledPaymentsForDistributor = (distId: string) => db().payment.findMany({ where: { reconciledAt: null, routeStop: { distributorId: distId } }, select: { capturedAt: true, amountEtb: true } });
+export const loadDeliveredStopsForDistributor = (distId: string) => db().routeStop.findMany({ where: { distributorId: distId, status: 'DELIVERED' }, select: { id: true, statusUpdatedAt: true } });
+export const loadReconciledStopsForDistributor = (distId: string) => db().payment.findMany({ where: { reconciledAt: { not: null }, routeStop: { distributorId: distId } }, select: { routeStopId: true } });
+export const updateCreditAccount = (id: string, i: { oldestUnpaidAt: Date | null; exposureEtb: number }) => db().creditAccount.update({ where: { id }, data: i });
+export const createAudit = (i: any) => db().auditLog.create({ data: { actorId: i.actorId, entity: i.entity, entityId: i.entityId, action: i.action, reason: i.reason, metaJson: i.meta as any } });
+export const loadRoutePlans = (since: Date) => db().routePlan.findMany({ where: { date: { gte: since } } });
+export const loadDeliveredStops = (since: Date) => db().routeStop.findMany({ where: { status: 'DELIVERED', statusUpdatedAt: { gte: since } }, select: { statusUpdatedAt: true, plannedEta: true } });
+export const loadFuelCost = (since: Date) => db().fuelLog.aggregate({ where: { capturedAt: { gte: since } }, _sum: { amountEtb: true } });
+export const loadFuelVariance = (since: Date) => db().fuelLog.findMany({ where: { capturedAt: { gte: since } }, select: { varianceFlag: true } });
+export const loadProofCount = (since: Date) => db().proofOfDelivery.count({ where: { capturedAt: { gte: since } } });
+export const loadCreditDecisions = (since: Date) => db().creditDecision.findMany({ where: { createdAt: { gte: since } }, select: { outcome: true, orderId: true } });
+export const loadDispatchedRoutes = (orderIds: string[]) => db().routePlan.findMany({ where: { stops: { some: { orderId: { in: orderIds } } } }, select: { stops: { select: { orderId: true } } } });
+export const loadConfirmedSlots = (since: Date) => db().dispatchDockSlot.findMany({ where: { status: 'CONFIRMED', confirmedAt: { gte: since, not: null } }, select: { startAt: true, confirmedAt: true } });
+export const loadActiveVehicleIds = (since: Date) => db().routePlan.findMany({ where: { date: { gte: since } }, select: { vehicleId: true } });
+export async function countStockoutSkus(): Promise<number> { const s = await db().sku.findMany({ where: { active: true }, select: { stockOnHand: true, safetyStock: true } }); return s.filter((x) => x.stockOnHand < x.safetyStock).length > 0 ? 1 : 0; }
+EOF
+W services/worker/src/jobs/metric-computers.ts <<'EOF'
+export interface SourceData {
+  routePlans: { plannedKm: number; plannedMin: number; status: string }[];
+  deliveredStops: { statusUpdatedAt: Date; plannedEta: Date }[];
+  fuelCostEtb: number; highVar: number; routeCount: number; proofCount: number;
+  blocked: number; blockedDispatched: number; stockoutDays: number;
+  confirmedSlots: { startAt: Date; confirmedAt: Date }[];
+  vehicles: number; days: number; wearRate: number;
+}
+const r2 = (n: number) => Math.round(n * 100) / 100;
+const avg = (xs: number[]) => (xs.length === 0 ? 0 : xs.reduce((s, x) => s + x, 0) / xs.length);
+const med = (xs: number[]) => { if (!xs.length) return 0; const s = [...xs].sort((a, b) => a - b); const m = Math.floor(s.length / 2); return s.length % 2 === 0 ? (s[m - 1]! + s[m]!) / 2 : s[m]!; };
+export const computeVariableCostEtb = (d: SourceData) => (d.routePlans.length === 0 && d.fuelCostEtb === 0 ? null : Math.round(d.fuelCostEtb + d.routePlans.reduce((s, r) => s + r.plannedKm, 0) * d.wearRate));
+export const computeKmPerDelivery = (d: SourceData) => (d.deliveredStops.length === 0 ? null : r2(d.routePlans.reduce((s, r) => s + r.plannedKm, 0) / d.deliveredStops.length));
+export const computeMedianDeliveryHours = (d: SourceData) => { const m = d.routePlans.filter((r) => r.status !== 'PLANNED').map((r) => r.plannedMin); return m.length === 0 ? null : r2(med(m) / 60); };
+export const computeOnTimeSlaPct = (d: SourceData) => (d.deliveredStops.length === 0 ? null : r2((d.deliveredStops.filter((s) => s.statusUpdatedAt <= s.plannedEta).length / d.deliveredStops.length) * 100));
+export const computeStockoutSkuDays = (d: SourceData) => d.stockoutDays;
+export const computeDockTurnaroundMinutes = (d: SourceData) => (d.confirmedSlots.length === 0 ? null : r2(avg(d.confirmedSlots.map((s) => (s.confirmedAt.getTime() - s.startAt.getTime()) / 60_000))));
+export const computeReserveViolations = (d: SourceData) => (d.routeCount === 0 ? null : r2((d.highVar / d.routeCount) * 100));
+export const computeDeliveriesPerVehiclePerDay = (d: SourceData) => (d.vehicles === 0 || d.days === 0 ? null : r2(d.deliveredStops.length / d.vehicles / d.days));
+export const computeCleanEpodRatePct = (d: SourceData) => (d.deliveredStops.length === 0 ? null : r2(Math.min(100, (d.proofCount / d.deliveredStops.length) * 100)));
+export const computeCreditBlockedPreDispatchPct = (d: SourceData) => (d.blocked === 0 ? 100 : r2(((d.blocked - d.blockedDispatched) / d.blocked) * 100));
+EOF
+W services/worker/src/jobs/metric-snapshot.ts <<'EOF'
+import * as repo from './repository.js';
+import { computeVariableCostEtb, computeKmPerDelivery, computeMedianDeliveryHours, computeOnTimeSlaPct, computeStockoutSkuDays, computeDockTurnaroundMinutes, computeReserveViolations, computeDeliveriesPerVehiclePerDay, computeCleanEpodRatePct, computeCreditBlockedPreDispatchPct, type SourceData } from './metric-computers.js';
+const WINDOW = 30;
+export async function runMetricSnapshot(triggeredBy: string): Promise<{ processed: number; skipped: number }> {
+  const run = await repo.createJobRun('metric_snapshot', triggeredBy);
+  const since = new Date(Date.now() - WINDOW * 86_400_000);
+  const today = new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), new Date().getUTCDate()));
+  try {
+    const [routes, stops, fuelCost, fuelVar, proofCount, decisions, slots, vehicles, stockout, assumptions] = await Promise.all([
+      repo.loadRoutePlans(since), repo.loadDeliveredStops(since), repo.loadFuelCost(since), repo.loadFuelVariance(since), repo.loadProofCount(since), repo.loadCreditDecisions(since), repo.loadConfirmedSlots(since), repo.loadActiveVehicleIds(since), repo.countStockoutSkus(), repo.loadAssumptions(),
+    ]);
+    const blockedIds = decisions.filter((d) => d.outcome === 'BLOCKED' && d.orderId).map((d) => d.orderId!);
+    const dispatched = blockedIds.length > 0 ? await repo.loadDispatchedRoutes(blockedIds) : [];
+    const dispatchedSet = new Set(dispatched.flatMap((r) => r.stops.map((s) => s.orderId)));
+    const assumptionMap = new Map(assumptions.map((a) => [a.key, a.value]));
+    const data: SourceData = {
+      routePlans: routes.map((r) => ({ plannedKm: Number(r.plannedKm), plannedMin: r.plannedMin, status: r.status })),
+      deliveredStops: stops.map((s) => ({ statusUpdatedAt: s.statusUpdatedAt, plannedEta: s.plannedEta })),
+      fuelCostEtb: Number(fuelCost._sum.amountEtb ?? 0),
+      highVar: fuelVar.filter((f) => f.varianceFlag === 'HIGH').length,
+      routeCount: routes.length, proofCount,
+      blocked: decisions.filter((d) => d.outcome === 'BLOCKED').length,
+      blockedDispatched: blockedIds.filter((id) => dispatchedSet.has(id)).length,
+      stockoutDays: stockout,
+      confirmedSlots: slots.map((s) => ({ startAt: s.startAt, confirmedAt: s.confirmedAt! })),
+      vehicles: new Set(vehicles.map((v) => v.vehicleId)).size,
+      days: WINDOW, wearRate: assumptionMap.get('vehicle_wear_etb_per_km') ?? 3.5,
+    };
+    const computations = [
+      { key: 'variable_cost_per_month_etb', value: computeVariableCostEtb(data) },
+      { key: 'km_per_delivery', value: computeKmPerDelivery(data) },
+      { key: 'median_delivery_hours', value: computeMedianDeliveryHours(data) },
+      { key: 'on_time_sla_pct', value: computeOnTimeSlaPct(data) },
+      { key: 'stockout_sku_days_per_month', value: computeStockoutSkuDays(data) },
+      { key: 'dock_turnaround_minutes', value: computeDockTurnaroundMinutes(data) },
+      { key: 'reserve_violations_per_100_routes', value: computeReserveViolations(data) },
+      { key: 'deliveries_per_vehicle_per_day', value: computeDeliveriesPerVehiclePerDay(data) },
+      { key: 'clean_epod_rate_pct', value: computeCleanEpodRatePct(data) },
+      { key: 'credit_blocked_pre_dispatch_pct', value: computeCreditBlockedPreDispatchPct(data) },
+    ];
+    let processed = 0, skipped = 0;
+    for (const c of computations) { if (c.value === null) { skipped++; continue; } await repo.upsertSnapshot(today, c.key, c.value); processed++; }
+    await repo.finishJobRun(run.id, { status: 'DONE', processedCount: processed, skippedCount: skipped });
+    return { processed, skipped };
+  } catch (err) {
+    await repo.finishJobRun(run.id, { status: 'FAILED', processedCount: 0, skippedCount: 0, error: err instanceof Error ? err.message : String(err) });
+    throw err;
+  }
+}
+EOF
+W services/worker/src/jobs/fuel-variance.ts <<'EOF'
+import * as repo from './repository.js';
+const WINDOW = 30;
+function computeL100(fills: { liters: number; odometerKm: number; capturedAt: Date }[]): { l100: number; at: Date }[] {
+  const sorted = [...fills].sort((a, b) => a.capturedAt.getTime() - b.capturedAt.getTime());
+  const out: { l100: number; at: Date }[] = [];
+  for (let i = 1; i < sorted.length; i++) { const d = sorted[i]!.odometerKm - sorted[i - 1]!.odometerKm; if (d <= 0) continue; out.push({ l100: (sorted[i]!.liters / d) * 100, at: sorted[i]!.capturedAt }); }
+  return out;
+}
+export async function runFuelVariance(triggeredBy: string): Promise<{ processed: number; skipped: number }> {
+  const run = await repo.createJobRun('fuel_variance', triggeredBy);
+  const since = new Date(Date.now() - WINDOW * 86_400_000);
+  try {
+    const vehicles = await repo.loadActiveVehicles();
+    let processed = 0, skipped = 0;
+    for (const v of vehicles) {
+      const fills = await repo.loadFuelFillsForVehicle(v.id, since);
+      if (fills.length < 4) { skipped++; continue; }
+      const l = computeL100(fills.map((f) => ({ liters: Number(f.liters), odometerKm: Number(f.odometerKm), capturedAt: f.capturedAt })));
+      if (l.length < 3) { skipped++; continue; }
+      const mean = l.reduce((s, x) => s + x.l100, 0) / l.length;
+      const variance = l.reduce((s, x) => s + (x.l100 - mean) ** 2, 0) / l.length;
+      const stdev = Math.sqrt(variance);
+      const outliers = l.filter((x) => x.l100 < mean - 2 * stdev || x.l100 > mean + 2 * stdev);
+      if (outliers.length > 0) {
+        await repo.createAudit({ actorId: 'worker/fuel_variance', entity: 'vehicle', entityId: v.id, action: 'variance_flagged',
+          reason: `${v.plate}: ${outliers.length} outlier(s) (mean ${mean.toFixed(1)}, σ ${stdev.toFixed(2)})`,
+          meta: { plate: v.plate, mean, stdev, outliers: outliers.length } });
+      }
+      processed++;
+    }
+    await repo.finishJobRun(run.id, { status: 'DONE', processedCount: processed, skippedCount: skipped });
+    return { processed, skipped };
+  } catch (err) {
+    await repo.finishJobRun(run.id, { status: 'FAILED', processedCount: 0, skippedCount: 0, error: err instanceof Error ? err.message : String(err) });
+    throw err;
+  }
+}
+EOF
+W services/worker/src/jobs/credit-rebuild.ts <<'EOF'
+import * as repo from './repository.js';
+export async function runCreditRebuild(triggeredBy: string): Promise<{ processed: number; skipped: number }> {
+  const run = await repo.createJobRun('credit_rebuild', triggeredBy);
+  try {
+    const accounts = await repo.loadAllCreditAccounts();
+    let processed = 0, skipped = 0;
+    for (const a of accounts) {
+      const [unrec, delivered, reconciledStops] = await Promise.all([
+        repo.loadUnreconciledPaymentsForDistributor(a.distributorId),
+        repo.loadDeliveredStopsForDistributor(a.distributorId),
+        repo.loadReconciledStopsForDistributor(a.distributorId),
+      ]);
+      const recSet = new Set(reconciledStops.map((p) => p.routeStopId));
+      const candidates: Date[] = [...unrec.map((p) => p.capturedAt)];
+      for (const s of delivered) if (!recSet.has(s.id)) candidates.push(s.statusUpdatedAt);
+      const oldest = candidates.length === 0 ? null : candidates.reduce((o, d) => (d < o ? d : o));
+      const exposure = Math.round(unrec.reduce((s, p) => s + Number(p.amountEtb), 0) * 100) / 100;
+      const prevOldest = a.oldestUnpaidAt?.getTime() ?? null;
+      const prevExposure = Number(a.exposureEtb);
+      await repo.updateCreditAccount(a.id, { oldestUnpaidAt: oldest, exposureEtb: exposure });
+      processed++;
+      if ((oldest?.getTime() ?? null) !== prevOldest || Math.abs(prevExposure - exposure) > 1) {
+        await repo.createAudit({ actorId: 'worker/credit_rebuild', entity: 'credit_account', entityId: a.id, action: 'rebuilt',
+          reason: `Exposure ${prevExposure} → ${exposure}; oldest ${a.oldestUnpaidAt?.toISOString() ?? 'none'} → ${oldest?.toISOString() ?? 'none'}`,
+          meta: { previous_exposure: prevExposure, new_exposure: exposure } });
+      }
+    }
+    await repo.finishJobRun(run.id, { status: 'DONE', processedCount: processed, skippedCount: skipped });
+    return { processed, skipped };
+  } catch (err) {
+    await repo.finishJobRun(run.id, { status: 'FAILED', processedCount: 0, skippedCount: 0, error: err instanceof Error ? err.message : String(err) });
+    throw err;
+  }
+}
+EOF
+W services/worker/src/main.ts <<'EOF'
+import { Queue, Worker as BullWorker, type Job } from 'bullmq';
+import IORedis from 'ioredis';
+import cron from 'node-cron';
+import { runMetricSnapshot } from './jobs/metric-snapshot.js';
+import { runFuelVariance } from './jobs/fuel-variance.js';
+import { runCreditRebuild } from './jobs/credit-rebuild.js';
+
+const QUEUE = 'worker-jobs';
+const redis = new IORedis(process.env.REDIS_URL ?? 'redis://localhost:6379', { maxRetriesPerRequest: null, enableReadyCheck: false });
+redis.on('connect', () => console.log('[worker] redis connected'));
+redis.on('error', (e) => console.error('[worker] redis error', e.message));
+const queue = new Queue(QUEUE, { connection: redis });
+
+async function process(job: Job<{ triggeredBy?: string }>) {
+  const t = job.data?.triggeredBy ?? 'schedule';
+  switch (job.name) {
+    case 'metric_snapshot': { const r = await runMetricSnapshot(t); console.log(`[worker] metric_snapshot ${r.processed}/${r.skipped}`); break; }
+    case 'fuel_variance': { const r = await runFuelVariance(t); console.log(`[worker] fuel_variance ${r.processed}/${r.skipped}`); break; }
+    case 'credit_rebuild': { const r = await runCreditRebuild(t); console.log(`[worker] credit_rebuild ${r.processed}/${r.skipped}`); break; }
+    default: throw new Error(`unknown job: ${job.name}`);
+  }
+}
+const worker = new BullWorker<{ triggeredBy?: string }>(QUEUE, async (job) => process(job), { connection: redis, concurrency: 2 });
+worker.on('completed', (j) => console.log(`[worker] ✓ ${j.name}`));
+worker.on('failed', (j, e) => console.error(`[worker] ✗ ${j?.name}: ${e.message}`));
+
+cron.schedule('0 22 * * *', async () => { await queue.add('metric_snapshot', { triggeredBy: 'schedule' }); });
+cron.schedule('15 22 * * *', async () => { await queue.add('credit_rebuild', { triggeredBy: 'schedule' }); });
+cron.schedule('30 22 * * *', async () => { await queue.add('fuel_variance', { triggeredBy: 'schedule' }); });
+console.log('[worker] ready');
+process.on('SIGTERM', async () => { await worker.close(); await queue.close(); await redis.quit(); process.exit(0); });
+process.on('SIGINT', async () => { await worker.close(); await queue.close(); await redis.quit(); process.exit(0); });
+EOF
+W services/worker/src/jobs/__tests__/metric-computers.test.ts <<'EOF'
+import { describe, it, expect } from 'vitest';
+import { computeVariableCostEtb, computeKmPerDelivery, computeOnTimeSlaPct, computeCreditBlockedPreDispatchPct } from '../metric-computers.js';
+const base = { routePlans: [], deliveredStops: [], fuelCostEtb: 0, highVar: 0, routeCount: 0, proofCount: 0, blocked: 0, blockedDispatched: 0, stockoutDays: 0, confirmedSlots: [], vehicles: 0, days: 0, wearRate: 3.5 };
+describe('metric computers', () => {
+  it('variable cost null on empty', () => expect(computeVariableCostEtb(base)).toBeNull());
+  it('variable cost = fuel + wear', () => expect(computeVariableCostEtb({ ...base, fuelCostEtb: 100_000, routePlans: [{ plannedKm: 500, plannedMin: 240, status: 'DISPATCHED' }] })).toBe(101_750));
+  it('km per delivery', () => expect(computeKmPerDelivery({ ...base, routePlans: [{ plannedKm: 100, plannedMin: 60, status: 'DISPATCHED' }], deliveredStops: [{ statusUpdatedAt: new Date(), plannedEta: new Date() }, { statusUpdatedAt: new Date(), plannedEta: new Date() }] })).toBe(50));
+  it('on-time SLA', () => { const eta = new Date('2026-04-12T10:00:00Z'); expect(computeOnTimeSlaPct({ ...base, deliveredStops: [{ statusUpdatedAt: new Date('2026-04-12T09:55:00Z'), plannedEta: eta }, { statusUpdatedAt: new Date('2026-04-12T10:30:00Z'), plannedEta: eta }] })).toBe(50); });
+  it('credit 100 when no blocks', () => expect(computeCreditBlockedPreDispatchPct(base)).toBe(100));
+});
+EOF
+
+# ═══════════════════════════════════════════════════════════════════
+# ADMIN-WEB — add 4 new tabs (Audit, Notifications, Jobs, Monitoring)
+# ═══════════════════════════════════════════════════════════════════
+echo "▸ Admin tabs"
+
+# Audit
+W apps/admin-web/src/modules/audit/types.ts <<'EOF'
+export type { AuditLogEntry, AuditListResponse } from '@tera/contracts';
+EOF
+W apps/admin-web/src/modules/audit/api.ts <<'EOF'
+import { api } from '../../api/client';
+import type { AuditListResponse } from './types';
+export const auditKeys = { all: ['audit'] as const, list: (e: string, a: string) => [...auditKeys.all, 'list', e, a] as const };
+export function fetchAuditLog(f: { entity?: string; actor?: string; limit?: number }) {
+  const p = new URLSearchParams(); if (f.entity) p.set('entity', f.entity); if (f.actor) p.set('actor', f.actor); p.set('limit', String(f.limit ?? 100));
+  return api<AuditListResponse>({ path: `/audit/v1/log?${p}` });
+}
+EOF
+W apps/admin-web/src/modules/audit/hooks.ts <<'EOF'
+import { useQuery } from '@tanstack/react-query';
+import { auditKeys, fetchAuditLog } from './api';
+export const useAuditLog = (f: { entity?: string; actor?: string }) => useQuery({ queryKey: auditKeys.list(f.entity ?? '', f.actor ?? ''), queryFn: () => fetchAuditLog(f) });
+EOF
+W apps/admin-web/src/modules/audit/AuditPage.tsx <<'EOF'
+import { useState } from 'react';
+import { useI18n } from '@tera/i18n';
+import { EmptyState, Spinner, StatusPill } from '@tera/ui';
+import { useAuditLog } from './hooks';
+const ENTITIES = ['', 'route', 'dock_slot', 'payment', 'credit_override', 'notification'];
+export function AuditPage() {
+  const { t } = useI18n();
+  const [entity, setEntity] = useState(''); const [actor, setActor] = useState('');
+  const q = useAuditLog({ entity: entity || undefined, actor: actor || undefined });
+  return (
+    <div className="max-w-6xl mx-auto">
+      <header className="mb-6"><h1 className="text-2xl font-bold">{t('audit.title')}</h1><p className="text-sm text-muted mt-1">{t('audit.subtitle')}</p></header>
+      <div className="flex flex-wrap items-end gap-3 mb-4">
+        <label className="text-sm"><span className="text-muted block mb-1">{t('audit.filter.entity')}</span>
+          <select value={entity} onChange={(e) => setEntity(e.target.value)} className="rounded-md border border-border bg-surface px-3 py-2 min-w-[160px]">
+            {ENTITIES.map((e) => <option key={e} value={e}>{e || t('audit.filter.entity_all')}</option>)}
+          </select>
+        </label>
+        <label className="text-sm"><span className="text-muted block mb-1">{t('audit.filter.actor')}</span>
+          <input value={actor} onChange={(e) => setActor(e.target.value)} className="rounded-md border border-border bg-surface px-3 py-2 min-w-[180px]" /></label>
+        <button onClick={() => q.refetch()} className="ml-auto text-sm px-3 py-2 rounded-md border border-border bg-surface hover:bg-bg">{t('common.retry')}</button>
+      </div>
+      {q.isLoading && <Spinner label={t('common.loading')} />}
+      {q.data && q.data.entries.length === 0 && <EmptyState title={t('audit.empty')} hint={t('audit.empty_hint')} />}
+      {q.data && q.data.entries.length > 0 && (
+        <div className="border border-border rounded-md bg-surface overflow-hidden">
+          <table className="w-full text-sm"><thead className="bg-bg border-b border-border"><tr>
+            <th className="text-left px-4 py-3 font-medium text-muted">{t('audit.table.when')}</th>
+            <th className="text-left px-4 py-3 font-medium text-muted">{t('audit.table.actor')}</th>
+            <th className="text-left px-4 py-3 font-medium text-muted">{t('audit.table.action')}</th>
+            <th className="text-left px-4 py-3 font-medium text-muted">{t('audit.table.entity')}</th>
+            <th className="text-left px-4 py-3 font-medium text-muted">{t('audit.table.reason')}</th>
+          </tr></thead><tbody>{q.data.entries.map((e) => (
+            <tr key={e.id} className="border-b border-border last:border-0">
+              <td className="px-4 py-3 text-xs text-muted whitespace-nowrap">{new Date(e.created_at).toLocaleString()}</td>
+              <td className="px-4 py-3 text-xs font-mono">{e.actor_id}</td>
+              <td className="px-4 py-3"><StatusPill tone={e.action === 'dispatched' || e.action === 'reconciled' ? 'success' : e.action === 'create' ? 'warn' : 'neutral'}>{e.action}</StatusPill></td>
+              <td className="px-4 py-3 text-xs"><div className="font-medium">{e.entity}</div><div className="text-muted font-mono">{e.entity_id}</div></td>
+              <td className="px-4 py-3 text-sm max-w-md">{e.reason}</td>
+            </tr>
+          ))}</tbody></table>
+        </div>
+      )}
+    </div>
+  );
+}
+EOF
+W apps/admin-web/src/modules/audit/index.ts <<'EOF'
+export { AuditPage } from './AuditPage';
+export type { AuditLogEntry } from './types';
+EOF
+
+# Notifications
+W apps/admin-web/src/modules/notifications/types.ts <<'EOF'
+export type { NotificationLogEntry, NotificationChannel } from '@tera/contracts';
+EOF
+W apps/admin-web/src/modules/notifications/api.ts <<'EOF'
+import { api } from '../../api/client';
+import type { NotificationLogEntry, NotificationChannel } from './types';
+export const notifyKeys = { all: ['notifications'] as const, log: (c: string) => [...notifyKeys.all, 'log', c] as const };
+export function fetchNotifications(f: { channel?: string }) { const p = new URLSearchParams(); if (f.channel) p.set('channel', f.channel); p.set('limit', '100'); return api<{ total: number; entries: NotificationLogEntry[] }>({ path: `/notify/v1/log?${p}` }); }
+export function sendTest(channel: NotificationChannel, recipient: string) { return api<{ id: string; status: string; provider_ref: string | null }>({ method: 'POST', path: '/notify/v1/test', body: { channel, recipient } }); }
+EOF
+W apps/admin-web/src/modules/notifications/hooks.ts <<'EOF'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { notifyKeys, fetchNotifications, sendTest } from './api';
+import type { NotificationChannel } from './types';
+export const useNotifications = (f: { channel?: string }) => useQuery({ queryKey: notifyKeys.log(f.channel ?? ''), queryFn: () => fetchNotifications(f) });
+export function useSendTest() { const qc = useQueryClient(); return useMutation({ mutationFn: (i: { channel: NotificationChannel; recipient: string }) => sendTest(i.channel, i.recipient), onSuccess: () => qc.invalidateQueries({ queryKey: notifyKeys.all }) }); }
+EOF
+W apps/admin-web/src/modules/notifications/NotificationsPage.tsx <<'EOF'
+import { useState } from 'react';
+import { useI18n } from '@tera/i18n';
+import { Button, EmptyState, Spinner, StatusPill } from '@tera/ui';
+import { useNotifications, useSendTest } from './hooks';
+import type { NotificationChannel } from './types';
+const CHANNELS: { id: NotificationChannel; label: string }[] = [{ id: 'sms', label: 'SMS' }, { id: 'telegram', label: 'Telegram' }, { id: 'email', label: 'Email' }];
+export function NotificationsPage() {
+  const { t } = useI18n();
+  const [filter, setFilter] = useState(''); const [tc, setTc] = useState<NotificationChannel>('sms'); const [tr, setTr] = useState('+251911000001');
+  const q = useNotifications({ channel: filter || undefined }); const testMut = useSendTest();
+  return (
+    <div className="max-w-6xl mx-auto">
+      <header className="mb-6"><h1 className="text-2xl font-bold">{t('notify.title')}</h1><p className="text-sm text-muted mt-1">{t('notify.subtitle')}</p></header>
+      <div className="rounded-lg border border-primary/30 bg-primary/5 p-4 mb-6">
+        <p className="text-sm font-medium mb-3">{t('notify.test.title')}</p>
+        <div className="flex flex-wrap items-end gap-3">
+          <label className="text-sm"><span className="text-muted block mb-1">{t('notify.test.channel')}</span>
+            <select value={tc} onChange={(e) => setTc(e.target.value as NotificationChannel)} className="rounded-md border border-border bg-surface px-3 py-2">
+              {CHANNELS.map((c) => <option key={c.id} value={c.id}>{c.label}</option>)}
+            </select></label>
+          <label className="text-sm flex-1 min-w-[200px]"><span className="text-muted block mb-1">{t('notify.test.recipient')}</span>
+            <input value={tr} onChange={(e) => setTr(e.target.value)} className="w-full rounded-md border border-border bg-surface px-3 py-2" /></label>
+          <Button onClick={() => testMut.mutate({ channel: tc, recipient: tr.trim() })} loading={testMut.isPending}>{t('notify.test.send')}</Button>
+        </div>
+        {testMut.data && <p className="text-sm text-success mt-2">✓ {t('notify.test.success', { status: testMut.data.status, ref: testMut.data.provider_ref ?? '—' })}</p>}
+      </div>
+      <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
+        <p className="text-sm text-muted">{q.data?.total ?? 0} {t('notify.log.total')}</p>
+        <div className="inline-flex rounded-md border border-border bg-surface p-1 gap-1">
+          <button onClick={() => setFilter('')} className={`px-3 py-1.5 text-sm rounded ${filter === '' ? 'bg-bg font-medium' : 'text-muted hover:bg-bg'}`}>{t('notify.log.all')}</button>
+          {CHANNELS.map((c) => <button key={c.id} onClick={() => setFilter(c.id)} className={`px-3 py-1.5 text-sm rounded ${filter === c.id ? 'bg-bg font-medium' : 'text-muted hover:bg-bg'}`}>{c.label}</button>)}
+        </div>
+      </div>
+      {q.isLoading && <Spinner label={t('common.loading')} />}
+      {q.data && q.data.entries.length === 0 && <EmptyState title={t('notify.log.empty')} />}
+      {q.data && q.data.entries.length > 0 && (
+        <div className="border border-border rounded-md bg-surface overflow-hidden">
+          <table className="w-full text-sm"><thead className="bg-bg border-b border-border"><tr>
+            <th className="text-left px-4 py-3 font-medium text-muted">{t('notify.log.when')}</th>
+            <th className="text-left px-4 py-3 font-medium text-muted">{t('notify.log.channel')}</th>
+            <th className="text-left px-4 py-3 font-medium text-muted">{t('notify.log.recipient')}</th>
+            <th className="text-left px-4 py-3 font-medium text-muted">{t('notify.log.body')}</th>
+            <th className="text-right px-4 py-3 font-medium text-muted">{t('admin.md.status')}</th>
+          </tr></thead><tbody>{q.data.entries.map((e) => (
+            <tr key={e.id} className="border-b border-border last:border-0">
+              <td className="px-4 py-3 text-xs text-muted whitespace-nowrap">{new Date(e.sent_at).toLocaleString()}</td>
+              <td className="px-4 py-3 text-xs font-medium uppercase">{e.channel}</td>
+              <td className="px-4 py-3 text-xs font-mono">{e.recipient}</td>
+              <td className="px-4 py-3 text-sm max-w-md"><div className="text-xs text-muted">{e.template_key}</div><div>{e.rendered_body}</div></td>
+              <td className="px-4 py-3 text-right"><StatusPill tone={e.status === 'SENT' ? 'success' : e.status === 'STUB' ? 'warn' : 'danger'}>{e.status}</StatusPill></td>
+            </tr>
+          ))}</tbody></table>
+        </div>
+      )}
+    </div>
+  );
+}
+EOF
+W apps/admin-web/src/modules/notifications/index.ts <<'EOF'
+export { NotificationsPage } from './NotificationsPage';
+EOF
+
+# Jobs
+W apps/admin-web/src/modules/jobs/types.ts <<'EOF'
+export type { JobRun, JobKey, JobStatus, JobScheduleEntry } from '@tera/contracts';
+EOF
+W apps/admin-web/src/modules/jobs/api.ts <<'EOF'
+import { api } from '../../api/client';
+import type { JobRun, JobScheduleEntry, JobKey } from './types';
+export const jobsKeys = { all: ['jobs'] as const, runs: () => [...jobsKeys.all, 'runs'] as const, schedule: () => [...jobsKeys.all, 'schedule'] as const };
+export const fetchRuns = () => api<{ total: number; runs: JobRun[] }>({ path: '/admin/jobs/v1/runs?limit=50' });
+export const fetchSchedule = () => api<{ jobs: JobScheduleEntry[] }>({ path: '/admin/jobs/v1/schedule' });
+export const runJob = (key: JobKey) => api<{ job_key: JobKey; enqueued: true }>({ method: 'POST', path: `/admin/jobs/v1/${key}/run` });
+EOF
+W apps/admin-web/src/modules/jobs/hooks.ts <<'EOF'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { jobsKeys, fetchRuns, fetchSchedule, runJob } from './api';
+import type { JobKey } from './types';
+export const useRuns = () => useQuery({ queryKey: jobsKeys.runs(), queryFn: () => fetchRuns(), refetchInterval: 15_000 });
+export const useSchedule = () => useQuery({ queryKey: jobsKeys.schedule(), queryFn: () => fetchSchedule(), refetchInterval: 30_000 });
+export function useRunJob() { const qc = useQueryClient(); return useMutation({ mutationFn: (k: JobKey) => runJob(k), onSuccess: () => qc.invalidateQueries({ queryKey: jobsKeys.all }) }); }
+EOF
+W apps/admin-web/src/modules/jobs/JobsPage.tsx <<'EOF'
+import { useState } from 'react';
+import { useI18n } from '@tera/i18n';
+import { Button, EmptyState, Spinner, StatusPill } from '@tera/ui';
+import { useRuns, useSchedule, useRunJob } from './hooks';
+import type { JobKey, JobStatus } from './types';
+function tone(s: JobStatus): 'success' | 'warn' | 'danger' | 'neutral' { if (s === 'DONE') return 'success'; if (s === 'RUNNING') return 'warn'; if (s === 'FAILED') return 'danger'; return 'neutral'; }
+export function JobsPage() {
+  const { t } = useI18n();
+  const scheduleQ = useSchedule(); const runsQ = useRuns(); const runMut = useRunJob();
+  const [pending, setPending] = useState<JobKey | null>(null);
+  const run = (k: JobKey) => { setPending(k); runMut.mutate(k, { onSettled: () => setPending(null) }); };
+  return (
+    <div className="max-w-6xl mx-auto">
+      <header className="mb-6"><h1 className="text-2xl font-bold">{t('jobs.title')}</h1><p className="text-sm text-muted mt-1">{t('jobs.subtitle')}</p></header>
+      {scheduleQ.isLoading && <Spinner label={t('common.loading')} />}
+      {scheduleQ.data && scheduleQ.data.jobs.length > 0 && (
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mb-6">
+          {scheduleQ.data.jobs.map((s) => (
+            <div key={s.job_key} className="border border-border rounded-md bg-surface p-4 flex flex-col gap-2">
+              <div className="flex items-center justify-between">
+                <span className="text-sm font-medium">{t(s.label_key)}</span>
+                {s.last_run ? <StatusPill tone={tone(s.last_run.status)}>{s.last_run.status}</StatusPill> : <StatusPill tone="neutral">{t('jobs.never_run')}</StatusPill>}
+              </div>
+              <div className="text-xs text-muted font-mono">{s.schedule}</div>
+              <div className="text-xs text-muted">{t('jobs.next_run')}: {s.next_run_at ? new Date(s.next_run_at).toLocaleString() : '—'}</div>
+              {s.last_run && <div className="text-xs text-muted">{s.last_run.processed_count} ✓{s.last_run.skipped_count > 0 && `, ${s.last_run.skipped_count} skipped`}{s.last_run.duration_ms !== null && ` · ${s.last_run.duration_ms}ms`}</div>}
+              <Button size="sm" variant="secondary" onClick={() => run(s.job_key)} loading={pending === s.job_key}>{t('jobs.run_now')}</Button>
+            </div>
+          ))}
+        </div>
+      )}
+      <h2 className="text-sm font-semibold text-muted uppercase tracking-wide mb-3">{t('jobs.history')}</h2>
+      {runsQ.isLoading && <Spinner label={t('common.loading')} />}
+      {runsQ.data && runsQ.data.runs.length === 0 && <EmptyState title={t('jobs.history.empty')} />}
+      {runsQ.data && runsQ.data.runs.length > 0 && (
+        <div className="border border-border rounded-md bg-surface overflow-hidden">
+          <table className="w-full text-sm"><thead className="bg-bg border-b border-border"><tr>
+            <th className="text-left px-4 py-2 font-medium text-muted">{t('jobs.table.when')}</th>
+            <th className="text-left px-4 py-2 font-medium text-muted">{t('jobs.table.job')}</th>
+            <th className="text-left px-4 py-2 font-medium text-muted">{t('admin.md.status')}</th>
+            <th className="text-right px-4 py-2 font-medium text-muted">{t('jobs.table.processed')}</th>
+            <th className="text-right px-4 py-2 font-medium text-muted">{t('jobs.table.duration')}</th>
+            <th className="text-left px-4 py-2 font-medium text-muted">{t('jobs.table.triggered_by')}</th>
+          </tr></thead><tbody>{runsQ.data.runs.map((r) => (
+            <tr key={r.id} className="border-b border-border last:border-0">
+              <td className="px-4 py-2 text-xs text-muted whitespace-nowrap">{new Date(r.started_at).toLocaleString()}</td>
+              <td className="px-4 py-2 font-mono text-xs">{r.job_key}</td>
+              <td className="px-4 py-2"><StatusPill tone={tone(r.status)}>{r.status}</StatusPill></td>
+              <td className="px-4 py-2 text-right tabular-nums">{r.processed_count}{r.skipped_count > 0 && <span className="text-xs text-muted"> (+{r.skipped_count})</span>}</td>
+              <td className="px-4 py-2 text-right tabular-nums text-muted text-xs">{r.duration_ms !== null ? `${r.duration_ms}ms` : '—'}</td>
+              <td className="px-4 py-2 text-xs text-muted font-mono">{r.triggered_by}</td>
+            </tr>
+          ))}</tbody></table>
+        </div>
+      )}
+    </div>
+  );
+}
+EOF
+W apps/admin-web/src/modules/jobs/index.ts <<'EOF'
+export { JobsPage } from './JobsPage';
+EOF
+
+# Monitoring
+W apps/admin-web/src/modules/monitoring/types.ts <<'EOF'
+export type { MonitoringSnapshot } from '@tera/contracts';
+EOF
+W apps/admin-web/src/modules/monitoring/api.ts <<'EOF'
+import { api } from '../../api/client';
+import type { MonitoringSnapshot } from './types';
+export const monitoringKeys = { all: ['monitoring'] as const, snapshot: () => [...monitoringKeys.all, 'snapshot'] as const };
+export const fetchSnapshot = (signal?: AbortSignal) => api<MonitoringSnapshot>({ path: '/admin/monitoring/v1/snapshot', signal });
+EOF
+W apps/admin-web/src/modules/monitoring/hooks.ts <<'EOF'
+import { useQuery } from '@tanstack/react-query';
+import { monitoringKeys, fetchSnapshot } from './api';
+export const useSnapshot = () => useQuery({ queryKey: monitoringKeys.snapshot(), queryFn: ({ signal }) => fetchSnapshot(signal), refetchInterval: 10_000 });
+EOF
+W apps/admin-web/src/modules/monitoring/MonitoringPage.tsx <<'EOF'
+import { useI18n } from '@tera/i18n';
+import { EmptyState, Spinner, StatusPill } from '@tera/ui';
+import { useSnapshot } from './hooks';
+export function MonitoringPage() {
+  const { t } = useI18n(); const q = useSnapshot();
+  if (q.isLoading) return <div className="p-8"><Spinner label={t('common.loading')} /></div>;
+  if (q.isError || !q.data) return <div className="p-6"><div className="border border-danger/30 bg-dangerBg rounded-md p-4 text-sm text-danger">{t('common.error')}</div></div>;
+  const s = q.data; const tone = s.http_error_rate_pct > 5 ? 'danger' : s.http_error_rate_pct > 1 ? 'warn' : 'success';
+  return (
+    <div className="max-w-6xl mx-auto">
+      <header className="mb-6 flex items-start justify-between flex-wrap gap-4">
+        <div><h1 className="text-2xl font-bold">{t('monitoring.title')}</h1><p className="text-sm text-muted mt-1">{t('monitoring.subtitle')}</p>
+          <p className="text-xs text-muted mt-1">{t('monitoring.as_of')}: {new Date(s.as_of).toLocaleTimeString()} · {t('monitoring.uptime')}: {s.uptime_seconds}s</p></div>
+        <a href="/metrics" target="_blank" rel="noopener noreferrer" className="text-sm text-primary hover:underline">{t('monitoring.open_prometheus')} ↗</a>
+      </header>
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
+        <Stat label={t('monitoring.requests_total')} value={s.http_requests_total.toLocaleString()} />
+        <Stat label={t('monitoring.requests_5xx')} value={s.http_5xx_total.toLocaleString()} tone={s.http_5xx_total > 0 ? 'danger' : undefined} />
+        <Stat label={t('monitoring.error_rate')} value={`${s.http_error_rate_pct.toFixed(2)}%`} pillTone={tone} />
+        <Stat label={t('monitoring.uptime')} value={`${s.uptime_seconds}s`} />
+      </div>
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
+        <Stat label={t('monitoring.pending_orders')} value={String(s.pending_orders)} />
+        <Stat label={t('monitoring.unreconciled')} value={String(s.unreconciled_payments)} />
+        <Stat label={t('monitoring.stale_clients')} value={String(s.stale_sync_clients)} tone={s.stale_sync_clients > 3 ? 'warn' : undefined} />
+        <Stat label={t('monitoring.high_variance_fuel')} value={String(s.high_variance_fuel_logs_7d)} />
+      </div>
+      <h2 className="text-sm font-semibold text-muted uppercase tracking-wide mb-3">{t('monitoring.jobs_24h')}</h2>
+      {s.job_runs_24h.length === 0 ? <EmptyState title={t('monitoring.no_jobs_24h')} /> : (
+        <div className="border border-border rounded-md bg-surface overflow-hidden">
+          <table className="w-full text-sm"><thead className="bg-bg border-b border-border"><tr>
+            <th className="text-left px-4 py-2 font-medium text-muted">{t('monitoring.job')}</th>
+            <th className="text-left px-4 py-2 font-medium text-muted">{t('admin.md.status')}</th>
+            <th className="text-right px-4 py-2 font-medium text-muted">{t('monitoring.runs')}</th>
+          </tr></thead><tbody>{s.job_runs_24h.map((r, i) => (
+            <tr key={`${r.job}-${r.status}-${i}`} className="border-b border-border last:border-0">
+              <td className="px-4 py-2 font-mono text-xs">{r.job}</td>
+              <td className="px-4 py-2"><StatusPill tone={r.status === 'DONE' ? 'success' : r.status === 'FAILED' ? 'danger' : 'warn'}>{r.status}</StatusPill></td>
+              <td className="px-4 py-2 text-right tabular-nums">{r.count}</td>
+            </tr>
+          ))}</tbody></table>
+        </div>
+      )}
+    </div>
+  );
+}
+function Stat({ label, value, tone, pillTone }: { label: string; value: string; tone?: 'danger' | 'warn'; pillTone?: 'success' | 'warn' | 'danger' }) {
+  return <div className="border border-border rounded-md bg-surface px-4 py-3">
+    <p className="text-xs text-muted uppercase tracking-wide">{label}</p>
+    <div className="flex items-center gap-2 mt-1"><p className={`text-xl font-bold tabular-nums ${tone === 'danger' ? 'text-danger' : tone === 'warn' ? 'text-warn' : ''}`}>{value}</p>
+      {pillTone && <StatusPill tone={pillTone}>{pillTone === 'success' ? 'OK' : pillTone === 'warn' ? 'watch' : 'high'}</StatusPill>}</div>
+  </div>;
+}
+EOF
+W apps/admin-web/src/modules/monitoring/index.ts <<'EOF'
+export { MonitoringPage } from './MonitoringPage';
+EOF
+
+# Update admin AppLayout + routes
+W apps/admin-web/src/app/AppLayout.tsx <<'EOF'
+import { NavLink, Outlet } from 'react-router-dom';
+import { useI18n } from '@tera/i18n';
+const NAV = [
+  { to: '/masterdata', key: 'admin.nav.masterdata' },
+  { to: '/constraints', key: 'admin.nav.constraints' },
+  { to: '/audit', key: 'admin.nav.audit' },
+  { to: '/notifications', key: 'admin.nav.notifications' },
+  { to: '/jobs', key: 'admin.nav.jobs' },
+  { to: '/monitoring', key: 'admin.nav.monitoring' },
+];
+export function AppLayout() {
+  const { t } = useI18n();
+  return (
+    <div className="h-full flex">
+      <aside className="w-60 shrink-0 border-r border-border bg-surface flex flex-col">
+        <div className="px-5 py-4 border-b border-border"><p className="text-xs text-muted uppercase tracking-wide">{t('app.name')}</p><p className="text-lg font-bold">{t('admin.title')}</p></div>
+        <nav className="flex-1 p-2">{NAV.map((n) => <NavLink key={n.to} to={n.to} className={({ isActive }) => `block px-3 py-2 rounded-md text-sm ${isActive ? 'bg-bg text-text font-medium' : 'text-muted hover:bg-bg'}`}>{t(n.key)}</NavLink>)}</nav>
+      </aside>
+      <main className="flex-1 min-w-0 overflow-auto p-6"><Outlet /></main>
+    </div>
+  );
+}
+EOF
+W apps/admin-web/src/app/routes.tsx <<'EOF'
+import { createBrowserRouter, RouterProvider, Navigate } from 'react-router-dom';
+import { AppLayout } from './AppLayout';
+import { MasterdataPage } from '../modules/masterdata';
+import { ConstraintsPage } from '../modules/constraints';
+import { AuditPage } from '../modules/audit';
+import { NotificationsPage } from '../modules/notifications';
+import { JobsPage } from '../modules/jobs';
+import { MonitoringPage } from '../modules/monitoring';
+const router = createBrowserRouter([{ path: '/', element: <AppLayout />, children: [
+  { index: true, element: <Navigate to="/masterdata" replace /> },
+  { path: 'masterdata', element: <MasterdataPage /> },
+  { path: 'constraints', element: <ConstraintsPage /> },
+  { path: 'audit', element: <AuditPage /> },
+  { path: 'notifications', element: <NotificationsPage /> },
+  { path: 'jobs', element: <JobsPage /> },
+  { path: 'monitoring', element: <MonitoringPage /> },
+] }]);
+export function AppRouter() { return <RouterProvider router={router} />; }
+EOF
+
+# ═══════════════════════════════════════════════════════════════════
+# Docker-compose final + i18n additions
+# ═══════════════════════════════════════════════════════════════════
+node <<'NODE'
+const fs = require('fs');
+const en = JSON.parse(fs.readFileSync('packages/i18n/src/locales/en.json', 'utf8'));
+const am = JSON.parse(fs.readFileSync('packages/i18n/src/locales/am.json', 'utf8'));
+
+Object.assign(en, {
+  'admin.nav.audit': 'Audit', 'admin.nav.notifications': 'Notifications', 'admin.nav.jobs': 'Jobs', 'admin.nav.monitoring': 'Monitoring',
+  'audit.title': 'Audit log', 'audit.subtitle': 'Every consequential action in one chronological record.',
+  'audit.filter.entity': 'Entity', 'audit.filter.entity_all': 'All entities', 'audit.filter.actor': 'Actor',
+  'audit.empty': 'No audit entries yet', 'audit.empty_hint': 'Actions will appear here automatically.',
+  'audit.table.when': 'When', 'audit.table.actor': 'Actor', 'audit.table.action': 'Action', 'audit.table.entity': 'Entity', 'audit.table.reason': 'Reason',
+  'notify.title': 'Notifications', 'notify.subtitle': 'Every SMS, Telegram, and email attempt — logged with status.',
+  'notify.test.title': 'Send a test notification', 'notify.test.channel': 'Channel', 'notify.test.recipient': 'Recipient', 'notify.test.send': 'Send test',
+  'notify.test.success': 'Sent · status {status} · provider ref {ref}',
+  'notify.log.total': 'notifications logged', 'notify.log.all': 'All', 'notify.log.empty': 'No notifications yet',
+  'notify.log.when': 'When', 'notify.log.channel': 'Channel', 'notify.log.recipient': 'Recipient', 'notify.log.body': 'Body',
+  'jobs.title': 'Scheduled jobs', 'jobs.subtitle': 'Nightly jobs for ROI metrics, fuel variance, credit rebuild.',
+  'jobs.never_run': 'never run', 'jobs.next_run': 'Next', 'jobs.last_run': 'Last', 'jobs.run_now': 'Run now',
+  'jobs.history': 'Run history', 'jobs.history.empty': 'No job runs yet',
+  'jobs.table.when': 'When', 'jobs.table.job': 'Job', 'jobs.table.processed': 'Processed', 'jobs.table.duration': 'Duration', 'jobs.table.triggered_by': 'Triggered by',
+  'jobs.job.metric_snapshot': 'Metric snapshot', 'jobs.job.credit_rebuild': 'Credit rebuild', 'jobs.job.fuel_variance': 'Fuel variance',
+  'monitoring.title': 'Monitoring', 'monitoring.subtitle': 'Live system health — requests, solves, gauges, job runs.',
+  'monitoring.as_of': 'As of', 'monitoring.uptime': 'Uptime', 'monitoring.open_prometheus': 'Open /metrics',
+  'monitoring.requests_total': 'HTTP requests', 'monitoring.requests_5xx': '5xx errors', 'monitoring.error_rate': 'Error rate',
+  'monitoring.pending_orders': 'Pending orders', 'monitoring.unreconciled': 'Unreconciled payments',
+  'monitoring.stale_clients': 'Stale sync clients', 'monitoring.high_variance_fuel': 'High-variance fuel (7d)',
+  'monitoring.jobs_24h': 'Job runs (last 24h)', 'monitoring.job': 'Job', 'monitoring.runs': 'Runs', 'monitoring.no_jobs_24h': 'No job runs in the last 24h',
+});
+Object.assign(am, {
+  'admin.nav.audit': 'ኦዲት', 'admin.nav.notifications': 'ማሳወቂያዎች', 'admin.nav.jobs': 'ሥራዎች', 'admin.nav.monitoring': 'ክትትል',
+  'audit.title': 'የኦዲት መዝገብ', 'audit.subtitle': 'እያንዳንዱ ጠቃሚ እርምጃ',
+  'audit.filter.entity': 'አካል', 'audit.filter.entity_all': 'ሁሉም አካላት', 'audit.filter.actor': 'ተዋናይ',
+  'audit.empty': 'እስካሁን መዝገብ የለም', 'audit.empty_hint': 'እርምጃዎች በራስ-ሰር ይታያሉ',
+  'audit.table.when': 'መቼ', 'audit.table.actor': 'ተዋናይ', 'audit.table.action': 'እርምጃ', 'audit.table.entity': 'አካል', 'audit.table.reason': 'ምክንያት',
+  'notify.title': 'ማሳወቂያዎች', 'notify.subtitle': 'እያንዳንዱ የSMS፣ የቴሌግራም እና የኢሜይል ሙከራ',
+  'notify.test.title': 'የሙከራ ማሳወቂያ ላክ', 'notify.test.channel': 'ሰርጥ', 'notify.test.recipient': 'ተቀባይ', 'notify.test.send': 'ሙከራ ላክ',
+  'notify.test.success': 'ተልኳል · ሁኔታ {status} · ማጣቀሻ {ref}',
+  'notify.log.total': 'ማሳወቂያዎች', 'notify.log.all': 'ሁሉም', 'notify.log.empty': 'ማሳወቂያ የለም',
+  'notify.log.when': 'መቼ', 'notify.log.channel': 'ሰርጥ', 'notify.log.recipient': 'ተቀባይ', 'notify.log.body': 'ይዘት',
+  'jobs.title': 'የተያዙ ሥራዎች', 'jobs.subtitle': 'የሌሊት ሥራዎች',
+  'jobs.never_run': 'አልተሠራም', 'jobs.next_run': 'ቀጣይ', 'jobs.last_run': 'የመጨረሻ', 'jobs.run_now': 'አሁን አሂድ',
+  'jobs.history': 'የሥራ ታሪክ', 'jobs.history.empty': 'እስካሁን ሩጫ የለም',
+  'jobs.table.when': 'መቼ', 'jobs.table.job': 'ሥራ', 'jobs.table.processed': 'የተሠራ', 'jobs.table.duration': 'ቆይታ', 'jobs.table.triggered_by': 'ያስነሳው',
+  'jobs.job.metric_snapshot': 'የመለኪያ ቅጽበታዊ እይታ', 'jobs.job.credit_rebuild': 'የክሬዲት ግንባታ', 'jobs.job.fuel_variance': 'የነዳጅ ልዩነት',
+  'monitoring.title': 'ክትትል', 'monitoring.subtitle': 'የቀጥታ ስርዓት ጤና',
+  'monitoring.as_of': 'እንደ', 'monitoring.uptime': 'የሥራ ጊዜ', 'monitoring.open_prometheus': '/metrics ክፈት',
+  'monitoring.requests_total': 'HTTP ጥያቄዎች', 'monitoring.requests_5xx': '5xx ስህተቶች', 'monitoring.error_rate': 'የስህተት መጠን',
+  'monitoring.pending_orders': 'በመጠባበቅ ትዕዛዞች', 'monitoring.unreconciled': 'ያልተስተካከሉ ክፍያዎች',
+  'monitoring.stale_clients': 'ያረጁ ደንበኞች', 'monitoring.high_variance_fuel': 'ከፍተኛ-ልዩነት ነዳጅ',
+  'monitoring.jobs_24h': 'የሥራ ሩጫዎች (24ሰ)', 'monitoring.job': 'ሥራ', 'monitoring.runs': 'ሩጫዎች', 'monitoring.no_jobs_24h': 'ሩጫ የለም',
+});
+
+// Exec/finance/portal keys for backend readiness
+Object.assign(en, {
+  'exec.tile.variable_cost': 'Variable cost / month', 'exec.tile.km': 'Km per delivery', 'exec.tile.delivery_time': 'Median delivery time',
+  'exec.tile.on_time': 'On-time SLA', 'exec.tile.stockout': 'Stockout SKU-days', 'exec.tile.dock': 'Dock turnaround',
+  'exec.tile.fuel_risk': 'Fuel reserve violations', 'exec.tile.fleet': 'Deliveries/vehicle/day', 'exec.tile.accuracy': 'Clean e-POD', 'exec.tile.credit': 'Credit pre-screen',
+  'notify.template.test': 'Test', 'notify.template.eta_alert': 'ETA alert', 'notify.template.order_confirmed': 'Order confirmed', 'notify.template.delivery_completed': 'Delivery completed',
+});
+Object.assign(am, {
+  'exec.tile.variable_cost': 'ተለዋዋጭ ወጪ', 'exec.tile.km': 'ኪሜ በማድረስ', 'exec.tile.delivery_time': 'የማድረስ ጊዜ',
+  'exec.tile.on_time': 'በሰዓቱ SLA', 'exec.tile.stockout': 'ከመጋዘን ያለፈ', 'exec.tile.dock': 'የመጫኛ ጊዜ',
+  'exec.tile.fuel_risk': 'የነዳጅ ጥሰቶች', 'exec.tile.fleet': 'ማድረሶች/ተሽከርካሪ/ቀን', 'exec.tile.accuracy': 'e-POD መዝገቦች', 'exec.tile.credit': 'ክሬዲት ምርመራ',
+  'notify.template.test': 'ሙከራ', 'notify.template.eta_alert': 'ETA ማንቂያ', 'notify.template.order_confirmed': 'ትዕዛዝ ተረጋግጧል', 'notify.template.delivery_completed': 'ማድረስ ተጠናቅቋል',
+});
+
+fs.writeFileSync('packages/i18n/src/locales/en.json', JSON.stringify(en, null, 2) + '\n');
+fs.writeFileSync('packages/i18n/src/locales/am.json', JSON.stringify(am, null, 2) + '\n');
+console.log('  i18n keys updated (audit + notify + jobs + monitoring + exec tiles)');
+NODE
+
+echo ""
+echo "════════════════════════════════════════════════════════════════"
+echo "✓ Part 3a complete — backend completion + optimizer + worker + 4 admin tabs"
+echo "════════════════════════════════════════════════════════════════"
+echo ""
+echo "What's runnable NOW:"
+echo ""
+echo "  Backend (7 new modules):"
+echo "    • analytics (/analytics/v1/dashboard, /baseline/freeze, /cost-assumptions)"
+echo "    • payments (/payments/v1/unreconciled, /:id/reconcile)"
+echo "    • portal (/portal/v1/me, /catalog, /orders, /statements, /disputes)"
+echo "    • audit (/audit/v1/log)"
+echo "    • notify (/notify/v1/log, /templates, /send, /test)"
+echo "    • admin/jobs (/admin/jobs/v1/runs, /schedule, /:key/run)"
+echo "    • monitoring (/metrics + /admin/monitoring/v1/snapshot)"
+echo ""
+echo "  Services:"
+echo "    • services/optimizer — real BullMQ consumer for route-solve queue"
+echo "    • services/worker — 3 nightly jobs (metric_snapshot, credit_rebuild, fuel_variance)"
+echo ""
+echo "  Admin-web (4 new tabs):"
+echo "    • Audit — filterable table with meta JSON"
+echo "    • Notifications — send test + log viewer"
+echo "    • Jobs — 3 cards + Run now + history table"
+echo "    • Monitoring — 8 stat cards + jobs 24h"
+echo ""
+echo "Setup (5 terminals):"
+echo "  pnpm install"
+echo "  docker compose up -d mysql redis"
+echo "  pnpm db:generate && pnpm db:migrate && pnpm db:seed"
+echo ""
+echo "  pnpm --filter @tera/api dev              # terminal 1: :8000"
+echo "  pnpm --filter @tera/optimizer dev        # terminal 2: VRP worker"
+echo "  pnpm --filter @tera/worker dev           # terminal 3: nightly jobs"
+echo "  pnpm --filter admin-web dev              # terminal 4: :5175"
+echo "  pnpm --filter dispatcher-web dev         # terminal 5: :5173"
+echo ""
+echo "Try the new tabs at http://localhost:5175:"
+echo ""
+echo "  AUDIT tab:"
+echo "  1. Shows 4 seeded entries (override, dispatch, confirmed, reconciled)"
+echo "  2. Filter entity='route' → 1 row"
+echo "  3. Every dispatcher dispatch or finance reconcile adds a new entry"
+echo ""
+echo "  NOTIFICATIONS tab:"
+echo "  4. Test panel at top: SMS/Telegram/Email + recipient"
+echo "  5. Click 'Send test' → success banner + new row appears in log below"
+echo "  6. Server console shows '[SMS STUB] → +251911000001'"
+echo "  7. Filter by channel → narrows log"
+echo ""
+echo "  JOBS tab:"
+echo "  8. 3 job cards (Metric snapshot, Credit rebuild, Fuel variance)"
+echo "     Each shows schedule (0 22 * * *) + next run + never run"
+echo "  9. Click 'Run now' on Metric snapshot"
+echo " 10. Worker console: '[worker] ✓ metric_snapshot' + '10 processed, 0 skipped'"
+echo " 11. Card updates to DONE with duration + count"
+echo " 12. History table shows the run"
+echo " 13. Now open exec-web /dashboard (Part 3b) → numbers are real, from worker"
+echo ""
+echo "  MONITORING tab:"
+echo " 14. 4 cards: HTTP requests, 5xx, error rate (0%), uptime"
+echo " 15. 4 cards: pending orders (10), unreconciled, stale clients, high-variance fuel"
+echo " 16. Job runs 24h table shows any completed runs"
+echo " 17. Click 'Open /metrics' → raw Prometheus format"
+echo "     Try: curl http://localhost:8000/metrics | head -30"
+echo ""
+echo "  END-TO-END:"
+echo " 18. Open dispatcher-web → dispatch a V-102 route"
+echo " 19. Open admin-web → Audit tab → new 'dispatched' entry appears"
+echo " 20. Open finance-web (Part 3b) → reconcile a payment"
+echo " 21. Audit tab → 'reconciled' entry appears"
+echo ""
+echo "  ASYNC SOLVE:"
+echo " 22. dispatcher-web /builder → select 3 orders + vehicle → Solve"
+echo "     → 'Waiting for solver…' → 'Solving route…' → result in ~1s"
+echo "     (optimizer process must be running in terminal 2)"
+echo " 23. If optimizer not running: 15s stall warning + 'Try sync solve'"
+echo ""
+echo "Tests:"
+echo "  pnpm --filter @tera/api test             # + analytics + payments = 27+"
+echo "  pnpm --filter @tera/optimizer test       # 1 state test"
+echo "  pnpm --filter @tera/worker test          # 5 metric computer tests"
+echo ""
+echo "════════════════════════════════════════════════════════════════"
+echo "📌 Build progress:"
+echo "  ✓ Part 1a — Phase 0: Foundation"
+echo "  ✓ Part 1b — Phases 1-2: Backend (credit/geo/orders/routing)"
+echo "  ✓ Part 1c — Phase 2 FE: Dispatcher"
+echo "  ✓ Part 2a — Phase 3: Offline sync + Driver"
+echo "  ✓ Part 2b — Phases 4-5: Warehouse + Admin"
+echo "  ✓ Part 3a — Phases 6 (backend) + 7 (services) + 8 (admin tabs) ← YOU ARE HERE"
+echo ""
+echo "📌 Next: Part 3b — FINAL"
+echo "  • Phase 6 FE: exec-web + finance-web + distributor-portal (3 apps)"
+echo "  • Phase 9: final i18n consolidation + smoke-test.sh + docs"
+echo "  • Docker compose verification"
+echo ""
+echo "After Part 3b, the ENTIRE system is complete."
+echo "All 8 frontends + 3 backend services + smoke test + docs."
+echo ""
+echo "Reply 'yes' to finish with Part 3b."
+echo "════════════════════════════════════════════════════════════════"
+
+# ═══════════════════════════════════════════════════════════════════
+# PHASE 6 FE — EXEC WEB
+# ═══════════════════════════════════════════════════════════════════
+echo "▸ Exec web"
+
+W apps/exec-web/package.json <<'EOF'
+{
+  "name": "exec-web", "private": true, "version": "0.1.0", "type": "module",
+  "scripts": { "dev": "vite", "build": "tsc -b && vite build", "test": "vitest run", "lint": "tsc --noEmit" },
+  "dependencies": {
+    "react": "^18.3.0", "react-dom": "^18.3.0", "react-router-dom": "^6.24.0", "@tanstack/react-query": "^5.50.0",
+    "@tera/ui": "workspace:*", "@tera/i18n": "workspace:*", "@tera/contracts": "workspace:*"
+  },
+  "devDependencies": {
+    "vite": "^5.3.0", "@vitejs/plugin-react": "^4.3.0", "typescript": "^5.4.0", "vitest": "^1.6.0",
+    "tailwindcss": "^3.4.0", "autoprefixer": "^10.4.0", "postcss": "^8.4.0",
+    "@testing-library/react": "^16.0.0", "@testing-library/jest-dom": "^6.4.0", "jsdom": "^24.1.0",
+    "@types/react": "^18.3.0", "@types/react-dom": "^18.3.0"
+  }
+}
+EOF
+W apps/exec-web/tsconfig.json <<'EOF'
+{ "extends": "../../tsconfig.base.json", "compilerOptions": { "composite": true, "outDir": "dist", "noEmit": true, "types": ["vite/client"] }, "include": ["src"] }
+EOF
+W apps/exec-web/vite.config.ts <<'EOF'
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+export default defineConfig({ plugins: [react()], server: { port: 5176 } });
+EOF
+W apps/exec-web/vitest.config.ts <<'EOF'
+import { defineConfig } from 'vitest/config';
+import react from '@vitejs/plugin-react';
+export default defineConfig({ plugins: [react()], test: { environment: 'jsdom', setupFiles: ['./src/test/setup.ts'], globals: true, css: false } });
+EOF
+W apps/exec-web/tailwind.config.ts <<'EOF'
+import type { Config } from 'tailwindcss';
+import preset from '@tera/ui/tailwind-preset';
+export default { presets: [preset], content: ['./index.html', './src/**/*.{ts,tsx}', '../../packages/ui/src/**/*.{ts,tsx}'] } satisfies Config;
+EOF
+W apps/exec-web/postcss.config.cjs <<'EOF'
+module.exports = { plugins: { tailwindcss: {}, autoprefixer: {} } };
+EOF
+W apps/exec-web/index.html <<'EOF'
+<!doctype html>
+<html lang="am"><head><meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<link rel="preconnect" href="https://fonts.googleapis.com" /><link href="https://fonts.googleapis.com/css2?family=Noto+Sans+Ethiopic:wght@400;500;600;700&display=swap" rel="stylesheet" />
+<title>ተራ OMS · አስፈጻሚ</title></head><body><div id="root"></div><script type="module" src="/src/main.tsx"></script></body></html>
+EOF
+W apps/exec-web/src/index.css <<'EOF'
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+@layer base { html, body, #root { height: 100%; } body { background-color: theme('colors.bg'); color: theme('colors.text'); font-family: theme('fontFamily.sans'); -webkit-font-smoothing: antialiased; } }
+EOF
+W apps/exec-web/src/vite-env.d.ts <<'EOF'
+/// <reference types="vite/client" />
+interface ImportMetaEnv { readonly VITE_API_BASE_URL: string; readonly VITE_DEFAULT_LOCALE: string; }
+interface ImportMeta { readonly env: ImportMetaEnv; }
+EOF
+W apps/exec-web/src/test/setup.ts <<'EOF'
+import '@testing-library/jest-dom/vitest';
+EOF
+W apps/exec-web/src/api/client.ts <<'EOF'
+const BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000';
+export class ApiError extends Error {
+  constructor(public status: number, public code: string, message: string, public details?: unknown) { super(message); }
+}
+export async function api<T>({ method = 'GET', path, body, signal }: { method?: string; path: string; body?: unknown; signal?: AbortSignal }): Promise<T> {
+  const res = await fetch(`${BASE}${path}`, { method, headers: { 'Content-Type': 'application/json' }, body: body !== undefined ? JSON.stringify(body) : undefined, signal });
+  if (!res.ok) { const p = await res.json().catch(() => ({})); throw new ApiError(res.status, p.code ?? 'unknown', p.message ?? res.statusText, p); }
+  return res.status === 204 ? (undefined as T) : res.json();
+}
+EOF
+W apps/exec-web/src/api/queryClient.ts <<'EOF'
+import { QueryClient } from '@tanstack/react-query';
+import { ApiError } from './client';
+export const queryClient = new QueryClient({ defaultOptions: { queries: { staleTime: 30_000, retry: (n, e) => (e instanceof ApiError && e.status < 500 ? false : n < 2) } } });
+EOF
+W apps/exec-web/src/main.tsx <<'EOF'
+import React from 'react';
+import ReactDOM from 'react-dom/client';
+import './index.css';
+import { AppProviders } from './app/AppProviders';
+import { AppRouter } from './app/routes';
+ReactDOM.createRoot(document.getElementById('root')!).render(<React.StrictMode><AppProviders><AppRouter /></AppProviders></React.StrictMode>);
+EOF
+W apps/exec-web/src/app/AppProviders.tsx <<'EOF'
+import type { ReactNode } from 'react';
+import { QueryClientProvider } from '@tanstack/react-query';
+import { I18nProvider, type Locale } from '@tera/i18n';
+import { queryClient } from '../api/queryClient';
+const locale = (import.meta.env.VITE_DEFAULT_LOCALE as Locale) ?? 'am';
+export function AppProviders({ children }: { children: ReactNode }) {
+  return <I18nProvider initialLocale={locale}><QueryClientProvider client={queryClient}>{children}</QueryClientProvider></I18nProvider>;
+}
+EOF
+W apps/exec-web/src/app/AppLayout.tsx <<'EOF'
+import { Outlet } from 'react-router-dom';
+import { useI18n } from '@tera/i18n';
+export function AppLayout() {
+  const { t } = useI18n();
+  return (
+    <div className="min-h-full bg-bg">
+      <header className="border-b border-border bg-surface px-6 py-3">
+        <div className="max-w-6xl mx-auto flex items-center gap-4">
+          <div className="flex-1"><p className="text-xs text-muted uppercase tracking-wide">{t('app.name')}</p><p className="text-lg font-bold">{t('exec.title')}</p></div>
+          <p className="text-sm text-muted">{t('exec.tagline')}</p>
+        </div>
+      </header>
+      <main className="p-6"><div className="max-w-6xl mx-auto"><Outlet /></div></main>
+    </div>
+  );
+}
+EOF
+W apps/exec-web/src/app/routes.tsx <<'EOF'
+import { createBrowserRouter, RouterProvider, Navigate } from 'react-router-dom';
+import { AppLayout } from './AppLayout';
+import { DashboardPage } from '../modules/money-saved';
+const router = createBrowserRouter([{ path: '/', element: <AppLayout />, children: [
+  { index: true, element: <Navigate to="/dashboard" replace /> },
+  { path: 'dashboard', element: <DashboardPage /> },
+] }]);
+export function AppRouter() { return <RouterProvider router={router} />; }
+EOF
+
+# module: money-saved
+W apps/exec-web/src/modules/money-saved/types.ts <<'EOF'
+export type { DashboardResponse, Tile, Hero, CostAssumption, MetricKey } from '@tera/contracts';
+EOF
+W apps/exec-web/src/modules/money-saved/api.ts <<'EOF'
+import { api } from '../../api/client';
+import type { DashboardResponse, CostAssumption } from './types';
+export const dashKeys = { all: ['dashboard'] as const, dashboard: () => [...dashKeys.all, 'dashboard'] as const, assumptions: () => [...dashKeys.all, 'assumptions'] as const };
+export function fetchDashboard(signal?: AbortSignal) { return api<DashboardResponse>({ path: '/analytics/v1/dashboard', signal }); }
+export function freezeBaseline(notes?: string) { return api<DashboardResponse>({ method: 'POST', path: '/analytics/v1/baseline/freeze', body: notes ? { notes } : {} }); }
+export function fetchAssumptions(signal?: AbortSignal) { return api<{ assumptions: CostAssumption[] }>({ path: '/analytics/v1/cost-assumptions', signal }); }
+export function updateAssumption(key: string, value: number) { return api<CostAssumption>({ method: 'PATCH', path: `/analytics/v1/cost-assumptions/${key}`, body: { value } }); }
+EOF
+W apps/exec-web/src/modules/money-saved/hooks.ts <<'EOF'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { dashKeys, fetchDashboard, freezeBaseline, fetchAssumptions, updateAssumption } from './api';
+export const useDashboard = () => useQuery({ queryKey: dashKeys.dashboard(), queryFn: ({ signal }) => fetchDashboard(signal) });
+export function useFreezeBaseline() { const qc = useQueryClient(); return useMutation({ mutationFn: (n?: string) => freezeBaseline(n), onSuccess: () => qc.invalidateQueries({ queryKey: dashKeys.all }) }); }
+export const useAssumptions = () => useQuery({ queryKey: dashKeys.assumptions(), queryFn: ({ signal }) => fetchAssumptions(signal) });
+export function useUpdateAssumption() { const qc = useQueryClient(); return useMutation({ mutationFn: ({ key, value }: { key: string; value: number }) => updateAssumption(key, value), onSuccess: () => { void qc.invalidateQueries({ queryKey: dashKeys.assumptions() }); void qc.invalidateQueries({ queryKey: dashKeys.dashboard() }); } }); }
+EOF
+W apps/exec-web/src/modules/money-saved/components/Sparkline.tsx <<'EOF'
+export function Sparkline({ data, color, width = 120, height = 28 }: { data: number[]; color: string; width?: number; height?: number }) {
+  if (data.length < 2) return <div style={{ width, height }} className="bg-bg rounded" />;
+  const min = Math.min(...data); const max = Math.max(...data); const range = max - min || 1; const pad = 2;
+  const points = data.map((v, i) => `${((i / (data.length - 1)) * width).toFixed(1)},${(height - pad - ((v - min) / range) * (height - 2 * pad)).toFixed(1)}`).join(' ');
+  return <svg width={width} height={height} viewBox={`0 0 ${width} ${height}`} role="img"><polyline points={points} fill="none" stroke={color} strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" /></svg>;
+}
+EOF
+W apps/exec-web/src/modules/money-saved/components/HeroTile.tsx <<'EOF'
+import { useI18n, formatETB } from '@tera/i18n';
+import type { Hero } from '../types';
+export function HeroTile({ hero }: { hero: Hero }) {
+  const { t } = useI18n();
+  return (
+    <div className="rounded-lg border border-primary/30 bg-gradient-to-br from-primary/5 to-primary/10 p-8">
+      <p className="text-sm font-medium text-primary uppercase tracking-wide mb-2">{t('exec.hero.label')}</p>
+      <div className="flex items-baseline gap-3 flex-wrap">
+        <p className="text-5xl font-bold text-primary tabular-nums">{formatETB(hero.monthly_savings_etb)}</p>
+        <p className="text-sm text-muted">{t('exec.hero.per_month')}</p>
+      </div>
+      <div className="grid grid-cols-2 gap-4 mt-6 max-w-lg">
+        <div><p className="text-xs text-muted uppercase">{t('exec.hero.cumulative')}</p>
+          <p className="text-xl font-semibold tabular-nums">{formatETB(hero.cumulative_savings_etb)}</p>
+          <p className="text-xs text-muted">{hero.days_since_baseline} {t('exec.hero.days')}</p></div>
+        <div><p className="text-xs text-muted uppercase">{t('exec.hero.annualized')}</p>
+          <p className="text-xl font-semibold tabular-nums">{formatETB(hero.annualized_savings_etb)}</p>
+          <p className="text-xs text-muted">{t('exec.hero.per_year')}</p></div>
+      </div>
+    </div>
+  );
+}
+EOF
+W apps/exec-web/src/modules/money-saved/components/DriverTile.tsx <<'EOF'
+import { useI18n, formatETB } from '@tera/i18n';
+import { StatusPill } from '@tera/ui';
+import { Sparkline } from './Sparkline';
+import type { Tile } from '../types';
+
+export function DriverTile({ tile }: { tile: Tile }) {
+  const { t } = useI18n();
+  const tone: 'success' | 'warn' | 'neutral' = tile.fully_in_target ? 'success' : tile.in_target ? 'warn' : 'neutral';
+  const badge = tile.fully_in_target ? t('exec.tile.fully_in_target') : tile.in_target ? t('exec.tile.in_target') : t('exec.tile.below_target');
+  const arrow = tile.improvement_pct >= 0 ? '↑' : '↓';
+  const sparkColor = tile.fully_in_target ? '#166534' : tile.in_target ? '#b45309' : '#6b6b6b';
+  return (
+    <div className="rounded-lg border border-border bg-surface p-4 flex flex-col gap-3">
+      <div className="flex items-start justify-between gap-2"><p className="text-sm font-medium leading-tight">{t(tile.label_key)}</p><StatusPill tone={tone}>{badge}</StatusPill></div>
+      <div className="flex items-baseline gap-2"><p className="text-2xl font-bold tabular-nums">{formatValue(tile.current, tile.unit)}</p><p className="text-xs text-muted">{tile.unit}</p></div>
+      <div className="flex items-center justify-between gap-2">
+        <div className="text-xs text-muted">{formatValue(tile.baseline, tile.unit)} → {formatValue(tile.current, tile.unit)}
+          <span className={`ml-2 font-medium ${tile.improvement_pct >= 0 ? 'text-success' : 'text-danger'}`}>{arrow} {Math.abs(tile.improvement_pct).toFixed(1)}%</span></div>
+        <Sparkline data={tile.trend_7d} color={sparkColor} />
+      </div>
+      {tile.etb_impact !== null && <div className="text-xs text-primary border-t border-border pt-2">≈ {formatETB(tile.etb_impact)} {t('exec.tile.etb_impact')}</div>}
+    </div>
+  );
+}
+function formatValue(v: number, unit: string): string {
+  if (unit === 'ETB') return new Intl.NumberFormat('en-ET', { maximumFractionDigits: 0 }).format(v);
+  if (unit === '%') return `${v.toFixed(1)}%`;
+  if (unit === 'SKU-days') return String(Math.round(v));
+  return v.toFixed(1);
+}
+EOF
+W apps/exec-web/src/modules/money-saved/components/DemoBanner.tsx <<'EOF'
+import { useI18n } from '@tera/i18n';
+import { Button } from '@tera/ui';
+export function DemoBanner({ onStartRealBaseline, isStarting }: { onStartRealBaseline: () => void; isStarting: boolean }) {
+  const { t } = useI18n();
+  return (
+    <div className="rounded-lg border border-warn/40 bg-warnBg p-4 flex items-start gap-4">
+      <div className="text-2xl">⚠</div>
+      <div className="flex-1"><p className="font-medium text-warn">{t('exec.demo.title')}</p><p className="text-sm text-muted mt-1">{t('exec.demo.body')}</p></div>
+      <Button variant="secondary" onClick={onStartRealBaseline} loading={isStarting}>{t('exec.demo.start')}</Button>
+    </div>
+  );
+}
+EOF
+W apps/exec-web/src/modules/money-saved/components/AssumptionsPanel.tsx <<'EOF'
+import { useState } from 'react';
+import { useI18n } from '@tera/i18n';
+import { Button } from '@tera/ui';
+import { useAssumptions, useUpdateAssumption } from '../hooks';
+import type { CostAssumption } from '../types';
+
+const LABELS: Record<string, string> = {
+  monthly_deliveries: 'exec.assumption.monthly_deliveries', monthly_routes: 'exec.assumption.monthly_routes',
+  daily_vehicles: 'exec.assumption.daily_vehicles', vehicle_wear_etb_per_km: 'exec.assumption.vehicle_wear',
+  margin_per_sku_day_etb: 'exec.assumption.margin_sku', cost_per_fuel_incident_etb: 'exec.assumption.fuel_incident',
+  avg_margin_per_delivery_etb: 'exec.assumption.margin_delivery',
+};
+export function AssumptionsPanel() {
+  const { t } = useI18n();
+  const [open, setOpen] = useState(false);
+  const list = useAssumptions(); const update = useUpdateAssumption();
+  if (!open) return <button onClick={() => setOpen(true)} className="text-sm text-muted hover:text-text underline">{t('exec.assumptions.configure')}</button>;
+  return (
+    <div className="rounded-lg border border-border bg-surface p-4">
+      <div className="flex items-center justify-between mb-3">
+        <p className="text-sm font-semibold">{t('exec.assumptions.title')}</p>
+        <button onClick={() => setOpen(false)} className="text-sm text-muted hover:text-text">{t('common.cancel')}</button>
+      </div>
+      {list.data && (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          {list.data.assumptions.map((a) => <Row key={a.key} assumption={a} onChange={(v) => update.mutate({ key: a.key, value: v })} isSaving={update.isPending && update.variables?.key === a.key} />)}
+        </div>
+      )}
+    </div>
+  );
+}
+function Row({ assumption, onChange, isSaving }: { assumption: CostAssumption; onChange: (v: number) => void; isSaving: boolean }) {
+  const { t } = useI18n();
+  const [value, setValue] = useState(String(assumption.value));
+  const dirty = parseFloat(value) !== assumption.value;
+  return (
+    <div className="text-sm"><p className="text-muted mb-1">{t(LABELS[assumption.key] ?? assumption.key)}</p>
+      <div className="flex gap-2"><input type="number" value={value} onChange={(e) => setValue(e.target.value)} className="flex-1 rounded-md border border-border bg-bg px-2 py-1" />
+        <span className="text-xs text-muted self-center">{assumption.unit}</span>
+        {dirty && <Button size="sm" onClick={() => onChange(parseFloat(value))} loading={isSaving}>{t('common.confirm')}</Button>}
+      </div></div>
+  );
+}
+EOF
+W apps/exec-web/src/modules/money-saved/DashboardPage.tsx <<'EOF'
+import { useI18n } from '@tera/i18n';
+import { EmptyState, Spinner } from '@tera/ui';
+import { HeroTile } from './components/HeroTile';
+import { DriverTile } from './components/DriverTile';
+import { DemoBanner } from './components/DemoBanner';
+import { AssumptionsPanel } from './components/AssumptionsPanel';
+import { useDashboard, useFreezeBaseline } from './hooks';
+
+export function DashboardPage() {
+  const { t } = useI18n();
+  const dashQ = useDashboard(); const freezeMut = useFreezeBaseline();
+  if (dashQ.isLoading) return <div className="p-8"><Spinner label={t('common.loading')} /></div>;
+  if (dashQ.isError || !dashQ.data) return <div className="p-6"><div className="border border-danger/30 bg-dangerBg rounded-md p-4 text-sm text-danger">{t('common.error')}</div></div>;
+  const { hero, tiles, is_demo, baseline_frozen_at } = dashQ.data;
+  if (!baseline_frozen_at) return <EmptyState title={t('exec.empty.no_baseline')} hint={t('exec.empty.no_baseline_hint')} />;
+  return (
+    <div className="flex flex-col gap-6">
+      <header className="flex items-end justify-between gap-4 flex-wrap">
+        <div><h1 className="text-2xl font-bold">{t('exec.heading')}</h1><p className="text-sm text-muted mt-1">{t('exec.as_of')}: {new Date(dashQ.data.as_of).toLocaleString()}</p></div>
+        <AssumptionsPanel />
+      </header>
+      {is_demo && <DemoBanner onStartRealBaseline={() => freezeMut.mutate(undefined, { onSuccess: () => void dashQ.refetch() })} isStarting={freezeMut.isPending} />}
+      {hero && <HeroTile hero={hero} />}
+      <section>
+        <h2 className="text-sm font-semibold text-muted uppercase tracking-wide mb-3">{t('exec.tiles.heading')}</h2>
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">{tiles.map((tile) => <DriverTile key={tile.metric_key} tile={tile} />)}</div>
+      </section>
+    </div>
+  );
+}
+EOF
+W apps/exec-web/src/modules/money-saved/index.ts <<'EOF'
+export { DashboardPage } from './DashboardPage';
+EOF
+
+# ═══════════════════════════════════════════════════════════════════
+# PHASE 6 FE — FINANCE WEB
+# ═══════════════════════════════════════════════════════════════════
+echo "▸ Finance web"
+
+W apps/finance-web/package.json <<'EOF'
+{
+  "name": "finance-web", "private": true, "version": "0.1.0", "type": "module",
+  "scripts": { "dev": "vite", "build": "tsc -b && vite build", "test": "vitest run", "lint": "tsc --noEmit" },
+  "dependencies": {
+    "react": "^18.3.0", "react-dom": "^18.3.0", "react-router-dom": "^6.24.0", "@tanstack/react-query": "^5.50.0",
+    "@tera/ui": "workspace:*", "@tera/i18n": "workspace:*", "@tera/contracts": "workspace:*"
+  },
+  "devDependencies": {
+    "vite": "^5.3.0", "@vitejs/plugin-react": "^4.3.0", "typescript": "^5.4.0", "vitest": "^1.6.0",
+    "tailwindcss": "^3.4.0", "autoprefixer": "^10.4.0", "postcss": "^8.4.0",
+    "@testing-library/react": "^16.0.0", "@testing-library/jest-dom": "^6.4.0", "jsdom": "^24.1.0",
+    "@types/react": "^18.3.0", "@types/react-dom": "^18.3.0"
+  }
+}
+EOF
+W apps/finance-web/tsconfig.json <<'EOF'
+{ "extends": "../../tsconfig.base.json", "compilerOptions": { "composite": true, "outDir": "dist", "noEmit": true, "types": ["vite/client"] }, "include": ["src"] }
+EOF
+W apps/finance-web/vite.config.ts <<'EOF'
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+export default defineConfig({ plugins: [react()], server: { port: 5177 } });
+EOF
+W apps/finance-web/vitest.config.ts <<'EOF'
+import { defineConfig } from 'vitest/config';
+import react from '@vitejs/plugin-react';
+export default defineConfig({ plugins: [react()], test: { environment: 'jsdom', setupFiles: ['./src/test/setup.ts'], globals: true, css: false } });
+EOF
+W apps/finance-web/tailwind.config.ts <<'EOF'
+import type { Config } from 'tailwindcss';
+import preset from '@tera/ui/tailwind-preset';
+export default { presets: [preset], content: ['./index.html', './src/**/*.{ts,tsx}', '../../packages/ui/src/**/*.{ts,tsx}'] } satisfies Config;
+EOF
+W apps/finance-web/postcss.config.cjs <<'EOF'
+module.exports = { plugins: { tailwindcss: {}, autoprefixer: {} } };
+EOF
+W apps/finance-web/index.html <<'EOF'
+<!doctype html>
+<html lang="am"><head><meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<link rel="preconnect" href="https://fonts.googleapis.com" /><link href="https://fonts.googleapis.com/css2?family=Noto+Sans+Ethiopic:wght@400;500;600;700&display=swap" rel="stylesheet" />
+<title>ተራ OMS · ፋይናንስ</title></head><body><div id="root"></div><script type="module" src="/src/main.tsx"></script></body></html>
+EOF
+W apps/finance-web/src/index.css <<'EOF'
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+@layer base { html, body, #root { height: 100%; } body { background-color: theme('colors.bg'); color: theme('colors.text'); font-family: theme('fontFamily.sans'); -webkit-font-smoothing: antialiased; } }
+EOF
+W apps/finance-web/src/vite-env.d.ts <<'EOF'
+/// <reference types="vite/client" />
+interface ImportMetaEnv { readonly VITE_API_BASE_URL: string; readonly VITE_DEFAULT_LOCALE: string; }
+interface ImportMeta { readonly env: ImportMetaEnv; }
+EOF
+W apps/finance-web/src/test/setup.ts <<'EOF'
+import '@testing-library/jest-dom/vitest';
+EOF
+W apps/finance-web/src/api/client.ts <<'EOF'
+const BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000';
+export class ApiError extends Error {
+  constructor(public status: number, public code: string, message: string, public details?: unknown) { super(message); }
+}
+export async function api<T>({ method = 'GET', path, body, signal }: { method?: string; path: string; body?: unknown; signal?: AbortSignal }): Promise<T> {
+  const res = await fetch(`${BASE}${path}`, { method, headers: { 'Content-Type': 'application/json' }, body: body !== undefined ? JSON.stringify(body) : undefined, signal });
+  if (!res.ok) { const p = await res.json().catch(() => ({})); throw new ApiError(res.status, p.code ?? 'unknown', p.message ?? res.statusText, p); }
+  return res.status === 204 ? (undefined as T) : res.json();
+}
+EOF
+W apps/finance-web/src/api/queryClient.ts <<'EOF'
+import { QueryClient } from '@tanstack/react-query';
+import { ApiError } from './client';
+export const queryClient = new QueryClient({ defaultOptions: { queries: { staleTime: 10_000, retry: (n, e) => (e instanceof ApiError && e.status < 500 ? false : n < 2) } } });
+EOF
+W apps/finance-web/src/main.tsx <<'EOF'
+import React from 'react';
+import ReactDOM from 'react-dom/client';
+import './index.css';
+import { AppProviders } from './app/AppProviders';
+import { AppRouter } from './app/routes';
+ReactDOM.createRoot(document.getElementById('root')!).render(<React.StrictMode><AppProviders><AppRouter /></AppProviders></React.StrictMode>);
+EOF
+W apps/finance-web/src/app/AppProviders.tsx <<'EOF'
+import type { ReactNode } from 'react';
+import { QueryClientProvider } from '@tanstack/react-query';
+import { I18nProvider, type Locale } from '@tera/i18n';
+import { queryClient } from '../api/queryClient';
+const locale = (import.meta.env.VITE_DEFAULT_LOCALE as Locale) ?? 'am';
+export function AppProviders({ children }: { children: ReactNode }) {
+  return <I18nProvider initialLocale={locale}><QueryClientProvider client={queryClient}>{children}</QueryClientProvider></I18nProvider>;
+}
+EOF
+W apps/finance-web/src/app/AppLayout.tsx <<'EOF'
+import { Outlet } from 'react-router-dom';
+import { useI18n } from '@tera/i18n';
+export function AppLayout() {
+  const { t } = useI18n();
+  return (
+    <div className="min-h-full bg-bg">
+      <header className="border-b border-border bg-surface px-6 py-3"><div className="max-w-6xl mx-auto flex items-center gap-4">
+        <div><p className="text-xs text-muted uppercase tracking-wide">{t('app.name')}</p><p className="text-lg font-bold">{t('finance.title')}</p></div>
+        <p className="text-sm text-muted ml-auto">{t('finance.tagline')}</p>
+      </div></header>
+      <main className="p-6"><div className="max-w-6xl mx-auto"><Outlet /></div></main>
+    </div>
+  );
+}
+EOF
+W apps/finance-web/src/app/routes.tsx <<'EOF'
+import { createBrowserRouter, RouterProvider, Navigate } from 'react-router-dom';
+import { AppLayout } from './AppLayout';
+import { FinancePage } from '../modules/finance';
+const router = createBrowserRouter([{ path: '/', element: <AppLayout />, children: [
+  { index: true, element: <Navigate to="/finance" replace /> },
+  { path: 'finance', element: <FinancePage /> },
+] }]);
+export function AppRouter() { return <RouterProvider router={router} />; }
+EOF
+
+# Finance module
+W apps/finance-web/src/modules/finance/tabs/credit-dashboard/api.ts <<'EOF'
+import { api } from '../../../../api/client';
+import type { ExposureResponse } from '@tera/contracts';
+export const exposureKeys = { all: ['credit-exposure'] as const, data: () => [...exposureKeys.all, 'data'] as const };
+export const fetchExposure = (signal?: AbortSignal) => api<ExposureResponse>({ path: '/credit/v1/exposure', signal });
+EOF
+W apps/finance-web/src/modules/finance/tabs/credit-dashboard/hooks.ts <<'EOF'
+import { useQuery } from '@tanstack/react-query';
+import { exposureKeys, fetchExposure } from './api';
+export const useExposure = () => useQuery({ queryKey: exposureKeys.data(), queryFn: ({ signal }) => fetchExposure(signal) });
+EOF
+W apps/finance-web/src/modules/finance/tabs/credit-dashboard/CreditDashboardTab.tsx <<'EOF'
+import { useI18n, formatETB } from '@tera/i18n';
+import { EmptyState, Spinner, StatusPill } from '@tera/ui';
+import { useExposure } from './hooks';
+import type { AgingBucket, ExposureAccount } from '@tera/contracts';
+
+const BUCKET_TONE: Record<AgingBucket['label'], 'success' | 'warn' | 'danger' | 'neutral'> = { current: 'success', watch: 'warn', overdue: 'danger', critical: 'danger' };
+
+export function CreditDashboardTab() {
+  const { t } = useI18n(); const q = useExposure();
+  if (q.isLoading) return <div className="p-6"><Spinner label={t('common.loading')} /></div>;
+  if (q.isError || !q.data) return <div className="text-sm text-danger p-4">{t('common.error')}</div>;
+  const d = q.data; const maxBucket = Math.max(...d.aging_buckets.map((b) => b.exposure_etb), 1);
+  return (
+    <div className="flex flex-col gap-6">
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <Stat label={t('finance.credit.total_exposure')} value={formatETB(d.total_exposure_etb)} />
+        <Stat label={t('finance.credit.total_limit')} value={formatETB(d.total_limit_etb)} />
+        <Stat label={t('finance.credit.utilization')} value={`${d.utilization_pct.toFixed(1)}%`} danger={d.utilization_pct > 80} />
+        <Stat label={t('finance.credit.over_limit')} value={String(d.accounts_over_limit)} danger={d.accounts_over_limit > 0} />
+      </div>
+      <div>
+        <h2 className="text-sm font-semibold text-muted uppercase tracking-wide mb-3">{t('finance.credit.aging_buckets')}</h2>
+        <div className="rounded-lg border border-border bg-surface p-4 flex flex-col gap-3">
+          {d.aging_buckets.map((b) => (
+            <div key={b.label} className="flex items-center gap-3">
+              <div className="w-24 shrink-0"><StatusPill tone={BUCKET_TONE[b.label]}>{t(`finance.credit.bucket.${b.label}`)}</StatusPill></div>
+              <div className="text-xs text-muted w-24">{b.days_range}</div>
+              <div className="flex-1 bg-bg rounded-full h-3 relative overflow-hidden"><div className={`h-full rounded-full ${b.label === 'current' ? 'bg-success' : b.label === 'watch' ? 'bg-warn' : 'bg-danger'}`} style={{ width: `${(b.exposure_etb / maxBucket) * 100}%` }} /></div>
+              <div className="w-32 text-right tabular-nums text-sm font-medium">{formatETB(b.exposure_etb)}</div>
+              <div className="w-16 text-right text-xs text-muted">{b.account_count} {t('finance.credit.accounts')}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+      {d.near_limit_accounts.length > 0 && (
+        <div>
+          <h2 className="text-sm font-semibold text-muted uppercase tracking-wide mb-3">{t('finance.credit.near_limit')} ({d.near_limit_accounts.length})</h2>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">{d.near_limit_accounts.map((a) => <NearLimitCard key={a.distributor_id} account={a} />)}</div>
+        </div>
+      )}
+      <div>
+        <h2 className="text-sm font-semibold text-muted uppercase tracking-wide mb-3">{t('finance.credit.all_accounts')} ({d.all_accounts.length})</h2>
+        {d.all_accounts.length === 0 ? <EmptyState title={t('finance.credit.no_accounts')} /> : (
+          <div className="border border-border rounded-md bg-surface overflow-hidden">
+            <table className="w-full text-sm"><thead className="bg-bg border-b border-border"><tr>
+              <th className="text-left px-4 py-3 font-medium text-muted">{t('credit.table.distributor')}</th>
+              <th className="text-left px-4 py-3 font-medium text-muted">{t('credit.table.region')}</th>
+              <th className="text-right px-4 py-3 font-medium text-muted">{t('finance.credit.exposure')}</th>
+              <th className="text-right px-4 py-3 font-medium text-muted">{t('finance.credit.limit')}</th>
+              <th className="text-right px-4 py-3 font-medium text-muted">{t('finance.credit.utilization')}</th>
+              <th className="text-right px-4 py-3 font-medium text-muted">{t('finance.credit.days_overdue')}</th>
+            </tr></thead><tbody>{d.all_accounts.map((a) => (
+              <tr key={a.distributor_id} className="border-b border-border last:border-0">
+                <td className="px-4 py-3 font-medium">{a.distributor_name}</td>
+                <td className="px-4 py-3 text-muted">{a.region}</td>
+                <td className="px-4 py-3 text-right tabular-nums">{formatETB(a.exposure_etb)}</td>
+                <td className="px-4 py-3 text-right tabular-nums text-muted">{formatETB(a.limit_etb)}</td>
+                <td className={`px-4 py-3 text-right tabular-nums ${a.utilization_pct > 100 ? 'text-danger font-medium' : a.utilization_pct > 80 ? 'text-warn font-medium' : ''}`}>{a.utilization_pct.toFixed(1)}%</td>
+                <td className={`px-4 py-3 text-right tabular-nums ${a.days_overdue > 30 ? 'text-danger font-medium' : a.days_overdue > 0 ? 'text-warn font-medium' : 'text-muted'}`}>{a.days_overdue}</td>
+              </tr>
+            ))}</tbody></table>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+function Stat({ label, value, danger }: { label: string; value: string; danger?: boolean }) {
+  return <div className="rounded-lg border border-border bg-surface px-4 py-3"><p className="text-xs text-muted uppercase">{label}</p><p className={`text-xl font-bold tabular-nums mt-1 ${danger ? 'text-danger' : ''}`}>{value}</p></div>;
+}
+function NearLimitCard({ account }: { account: ExposureAccount }) {
+  const { t } = useI18n();
+  const tone = account.utilization_pct > 100 ? 'text-danger' : 'text-warn'; const bar = account.utilization_pct > 100 ? 'bg-danger' : 'bg-warn';
+  return (
+    <div className="rounded-lg border border-border bg-surface p-4">
+      <div className="flex items-center justify-between mb-2"><span className="font-medium text-sm">{account.distributor_name}</span><span className={`text-sm font-semibold tabular-nums ${tone}`}>{account.utilization_pct.toFixed(0)}%</span></div>
+      <div className="text-xs text-muted mb-2">{formatETB(account.exposure_etb)} / {formatETB(account.limit_etb)}</div>
+      <div className="w-full bg-bg rounded-full h-2 overflow-hidden"><div className={`h-full ${bar}`} style={{ width: `${Math.min(account.utilization_pct, 100)}%` }} /></div>
+      {account.days_overdue > 0 && <p className="text-xs text-danger mt-2">{account.days_overdue} {t('finance.credit.days_overdue_suffix')}</p>}
+    </div>
+  );
+}
+EOF
+W apps/finance-web/src/modules/finance/tabs/overrides/api.ts <<'EOF'
+import { api } from '../../../../api/client';
+import type { OverridesListResponse } from '@tera/contracts';
+export const overridesKeys = { all: ['overrides'] as const, list: () => [...overridesKeys.all, 'list'] as const };
+export const fetchOverrides = (signal?: AbortSignal) => api<OverridesListResponse>({ path: '/credit/v1/overrides/list', signal });
+EOF
+W apps/finance-web/src/modules/finance/tabs/overrides/hooks.ts <<'EOF'
+import { useQuery } from '@tanstack/react-query';
+import { overridesKeys, fetchOverrides } from './api';
+export const useOverrides = () => useQuery({ queryKey: overridesKeys.list(), queryFn: ({ signal }) => fetchOverrides(signal) });
+EOF
+W apps/finance-web/src/modules/finance/tabs/overrides/OverridesTab.tsx <<'EOF'
+import { useMemo, useState } from 'react';
+import { useI18n } from '@tera/i18n';
+import { EmptyState, Spinner, StatusPill } from '@tera/ui';
+import { useOverrides } from './hooks';
+type Filter = 'all' | 'active' | 'expired';
+export function OverridesTab() {
+  const { t } = useI18n(); const [filter, setFilter] = useState<Filter>('active'); const q = useOverrides();
+  const rows = useMemo(() => { const all = q.data?.overrides ?? []; if (filter === 'active') return all.filter((r) => !r.expired); if (filter === 'expired') return all.filter((r) => r.expired); return all; }, [q.data, filter]);
+  if (q.isLoading) return <div className="p-6"><Spinner label={t('common.loading')} /></div>;
+  if (q.isError) return <div className="text-sm text-danger p-4">{t('common.error')}</div>;
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="flex items-center justify-between flex-wrap gap-3">
+        <p className="text-sm text-muted">{q.data?.total ?? 0} {t('finance.overrides.total')}</p>
+        <div className="inline-flex rounded-md border border-border bg-surface p-1 gap-1">
+          {(['active', 'expired', 'all'] as const).map((f) => <button key={f} onClick={() => setFilter(f)} className={`px-3 py-1.5 text-sm rounded ${filter === f ? 'bg-bg font-medium' : 'text-muted hover:bg-bg'}`}>{t(`finance.overrides.filter.${f}`)}</button>)}
+        </div>
+      </div>
+      {rows.length === 0 ? <EmptyState title={t('finance.overrides.empty')} /> : (
+        <div className="border border-border rounded-md bg-surface overflow-hidden">
+          <table className="w-full text-sm"><thead className="bg-bg border-b border-border"><tr>
+            <th className="text-left px-4 py-3 font-medium text-muted">{t('credit.table.distributor')}</th>
+            <th className="text-left px-4 py-3 font-medium text-muted">{t('finance.overrides.reason')}</th>
+            <th className="text-left px-4 py-3 font-medium text-muted">{t('finance.overrides.actor')}</th>
+            <th className="text-left px-4 py-3 font-medium text-muted">{t('finance.overrides.created')}</th>
+            <th className="text-left px-4 py-3 font-medium text-muted">{t('finance.overrides.expires')}</th>
+            <th className="text-right px-4 py-3 font-medium text-muted">{t('admin.md.status')}</th>
+          </tr></thead><tbody>{rows.map((o) => (
+            <tr key={o.id} className="border-b border-border last:border-0">
+              <td className="px-4 py-3 font-medium">{o.distributor_name}</td>
+              <td className="px-4 py-3 text-muted italic max-w-xs truncate">"{o.reason}"</td>
+              <td className="px-4 py-3 text-xs text-muted font-mono">{o.actor_id}</td>
+              <td className="px-4 py-3 text-xs text-muted">{new Date(o.created_at).toLocaleString()}</td>
+              <td className="px-4 py-3 text-xs text-muted">{new Date(o.expires_at).toLocaleString()}</td>
+              <td className="px-4 py-3 text-right"><StatusPill tone={o.expired ? 'neutral' : 'success'}>{o.expired ? t('finance.overrides.status.expired') : t('finance.overrides.status.active')}</StatusPill></td>
+            </tr>
+          ))}</tbody></table>
+        </div>
+      )}
+    </div>
+  );
+}
+EOF
+W apps/finance-web/src/modules/finance/tabs/reconciliation/api.ts <<'EOF'
+import { api } from '../../../../api/client';
+import type { UnreconciledPaymentsResponse } from '@tera/contracts';
+export const reconciliationKeys = { all: ['reconciliation'] as const, list: () => [...reconciliationKeys.all, 'unreconciled'] as const };
+export const fetchUnreconciled = (signal?: AbortSignal) => api<UnreconciledPaymentsResponse>({ path: '/payments/v1/unreconciled', signal });
+export function reconcilePayment(id: string, notes?: string) { return api<{ ok: true; reconciled_at: string }>({ method: 'POST', path: `/payments/v1/${id}/reconcile`, body: notes ? { notes } : {} }); }
+EOF
+W apps/finance-web/src/modules/finance/tabs/reconciliation/hooks.ts <<'EOF'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { reconciliationKeys, fetchUnreconciled, reconcilePayment } from './api';
+export const useUnreconciled = () => useQuery({ queryKey: reconciliationKeys.list(), queryFn: ({ signal }) => fetchUnreconciled(signal) });
+export function useReconcile() { const qc = useQueryClient(); return useMutation({ mutationFn: ({ id, notes }: { id: string; notes?: string }) => reconcilePayment(id, notes), onSuccess: () => qc.invalidateQueries({ queryKey: reconciliationKeys.all }) }); }
+EOF
+W apps/finance-web/src/modules/finance/tabs/reconciliation/ReconciliationTab.tsx <<'EOF'
+import { useState } from 'react';
+import { useI18n, formatETB } from '@tera/i18n';
+import { Button, EmptyState, Spinner, StatusPill } from '@tera/ui';
+import { useUnreconciled, useReconcile } from './hooks';
+export function ReconciliationTab() {
+  const { t } = useI18n(); const q = useUnreconciled(); const reconcile = useReconcile(); const [pending, setPending] = useState<string | null>(null);
+  if (q.isLoading) return <div className="p-6"><Spinner label={t('common.loading')} /></div>;
+  if (q.isError) return <div className="text-sm text-danger p-4">{t('common.error')}</div>;
+  const payments = q.data?.payments ?? [];
+  return (
+    <div className="flex flex-col gap-4">
+      <header className="flex items-center justify-between flex-wrap gap-3">
+        <div><h2 className="text-lg font-semibold">{t('finance.recon.title')}</h2><p className="text-sm text-muted">{t('finance.recon.subtitle')}</p></div>
+        <p className="text-sm text-muted">{payments.length} {t('finance.recon.pending')}</p>
+      </header>
+      {reconcile.isError && <div className="text-sm text-danger border border-danger/30 bg-dangerBg rounded px-3 py-2">{(reconcile.error as Error).message}</div>}
+      {payments.length === 0 ? <EmptyState title={t('finance.recon.empty')} /> : (
+        <div className="border border-border rounded-md bg-surface overflow-hidden">
+          <table className="w-full text-sm"><thead className="bg-bg border-b border-border"><tr>
+            <th className="text-left px-4 py-3 font-medium text-muted">{t('finance.recon.distributor')}</th>
+            <th className="text-left px-4 py-3 font-medium text-muted">{t('finance.recon.vehicle')}</th>
+            <th className="text-left px-4 py-3 font-medium text-muted">{t('finance.recon.method')}</th>
+            <th className="text-right px-4 py-3 font-medium text-muted">{t('finance.recon.amount')}</th>
+            <th className="text-left px-4 py-3 font-medium text-muted">{t('finance.recon.captured')}</th>
+            <th className="text-right px-4 py-3"></th>
+          </tr></thead><tbody>{payments.map((p) => (
+            <tr key={p.id} className="border-b border-border last:border-0">
+              <td className="px-4 py-3"><div className="font-medium">{p.distributor_name}</div><div className="text-xs text-muted">{p.driver_id}</div></td>
+              <td className="px-4 py-3 text-sm">{p.vehicle_id}</td>
+              <td className="px-4 py-3"><StatusPill tone={p.method === 'TELEBIRR' ? 'success' : 'neutral'}>{p.method}</StatusPill>{p.telebirr_ref && <div className="text-xs text-muted font-mono mt-1">{p.telebirr_ref}</div>}</td>
+              <td className="px-4 py-3 text-right tabular-nums font-medium">{formatETB(p.amount_etb)}</td>
+              <td className="px-4 py-3 text-xs text-muted">{new Date(p.captured_at).toLocaleString()}</td>
+              <td className="px-4 py-3 text-right"><Button size="sm" loading={reconcile.isPending && pending === p.id} onClick={() => { setPending(p.id); reconcile.mutate({ id: p.id }, { onSettled: () => setPending(null) }); }}>{t('finance.recon.reconcile')}</Button></td>
+            </tr>
+          ))}</tbody></table>
+        </div>
+      )}
+      <div className="text-xs text-muted rounded-md border border-border bg-surface p-3">{t('finance.recon.hint')}</div>
+    </div>
+  );
+}
+EOF
+W apps/finance-web/src/modules/finance/FinancePage.tsx <<'EOF'
+import { useState } from 'react';
+import { useI18n } from '@tera/i18n';
+import { CreditDashboardTab } from './tabs/credit-dashboard/CreditDashboardTab';
+import { OverridesTab } from './tabs/overrides/OverridesTab';
+import { ReconciliationTab } from './tabs/reconciliation/ReconciliationTab';
+type Tab = 'credit' | 'overrides' | 'reconciliation';
+const TABS: { id: Tab; key: string }[] = [{ id: 'credit', key: 'finance.tab.credit' }, { id: 'overrides', key: 'finance.tab.overrides' }, { id: 'reconciliation', key: 'finance.tab.reconciliation' }];
+export function FinancePage() {
+  const { t } = useI18n(); const [tab, setTab] = useState<Tab>('credit');
+  return (
+    <div>
+      <header className="mb-6"><h1 className="text-2xl font-bold">{t('finance.heading')}</h1><p className="text-sm text-muted mt-1">{t('finance.heading_hint')}</p></header>
+      <div className="border-b border-border mb-6"><nav className="flex gap-1 -mb-px">
+        {TABS.map((tt) => <button key={tt.id} onClick={() => setTab(tt.id)} className={`px-4 py-3 text-sm font-medium border-b-2 transition ${tab === tt.id ? 'border-primary text-primary' : 'border-transparent text-muted hover:text-text'}`}>{t(tt.key)}</button>)}
+      </nav></div>
+      {tab === 'credit' && <CreditDashboardTab />}
+      {tab === 'overrides' && <OverridesTab />}
+      {tab === 'reconciliation' && <ReconciliationTab />}
+    </div>
+  );
+}
+EOF
+W apps/finance-web/src/modules/finance/index.ts <<'EOF'
+export { FinancePage } from './FinancePage';
+EOF
+
+# ═══════════════════════════════════════════════════════════════════
+# PHASE 6 FE — DISTRIBUTOR PORTAL
+# ═══════════════════════════════════════════════════════════════════
+echo "▸ Distributor portal"
+
+W apps/distributor-portal/package.json <<'EOF'
+{
+  "name": "distributor-portal", "private": true, "version": "0.1.0", "type": "module",
+  "scripts": { "dev": "vite", "build": "tsc -b && vite build", "test": "vitest run", "lint": "tsc --noEmit" },
+  "dependencies": {
+    "react": "^18.3.0", "react-dom": "^18.3.0", "react-router-dom": "^6.24.0", "@tanstack/react-query": "^5.50.0",
+    "@tera/ui": "workspace:*", "@tera/i18n": "workspace:*", "@tera/contracts": "workspace:*"
+  },
+  "devDependencies": {
+    "vite": "^5.3.0", "@vitejs/plugin-react": "^4.3.0", "typescript": "^5.4.0", "vitest": "^1.6.0",
+    "tailwindcss": "^3.4.0", "autoprefixer": "^10.4.0", "postcss": "^8.4.0",
+    "@testing-library/react": "^16.0.0", "@testing-library/jest-dom": "^6.4.0", "jsdom": "^24.1.0",
+    "@types/react": "^18.3.0", "@types/react-dom": "^18.3.0"
+  }
+}
+EOF
+W apps/distributor-portal/tsconfig.json <<'EOF'
+{ "extends": "../../tsconfig.base.json", "compilerOptions": { "composite": true, "outDir": "dist", "noEmit": true, "types": ["vite/client"] }, "include": ["src"] }
+EOF
+W apps/distributor-portal/vite.config.ts <<'EOF'
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+export default defineConfig({ plugins: [react()], server: { port: 5178 } });
+EOF
+W apps/distributor-portal/vitest.config.ts <<'EOF'
+import { defineConfig } from 'vitest/config';
+import react from '@vitejs/plugin-react';
+export default defineConfig({ plugins: [react()], test: { environment: 'jsdom', setupFiles: ['./src/test/setup.ts'], globals: true, css: false } });
+EOF
+W apps/distributor-portal/tailwind.config.ts <<'EOF'
+import type { Config } from 'tailwindcss';
+import preset from '@tera/ui/tailwind-preset';
+export default { presets: [preset], content: ['./index.html', './src/**/*.{ts,tsx}', '../../packages/ui/src/**/*.{ts,tsx}'] } satisfies Config;
+EOF
+W apps/distributor-portal/postcss.config.cjs <<'EOF'
+module.exports = { plugins: { tailwindcss: {}, autoprefixer: {} } };
+EOF
+W apps/distributor-portal/index.html <<'EOF'
+<!doctype html>
+<html lang="am"><head><meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<link rel="preconnect" href="https://fonts.googleapis.com" /><link href="https://fonts.googleapis.com/css2?family=Noto+Sans+Ethiopic:wght@400;500;600;700&display=swap" rel="stylesheet" />
+<title>ተራ OMS · አከፋፋይ</title></head><body><div id="root"></div><script type="module" src="/src/main.tsx"></script></body></html>
+EOF
+W apps/distributor-portal/src/index.css <<'EOF'
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+@layer base { html, body, #root { height: 100%; } body { background-color: theme('colors.bg'); color: theme('colors.text'); font-family: theme('fontFamily.sans'); -webkit-font-smoothing: antialiased; } }
+EOF
+W apps/distributor-portal/src/vite-env.d.ts <<'EOF'
+/// <reference types="vite/client" />
+interface ImportMetaEnv { readonly VITE_API_BASE_URL: string; readonly VITE_DEFAULT_LOCALE: string; }
+interface ImportMeta { readonly env: ImportMetaEnv; }
+EOF
+W apps/distributor-portal/src/test/setup.ts <<'EOF'
+import '@testing-library/jest-dom/vitest';
+EOF
+W apps/distributor-portal/src/api/client.ts <<'EOF'
+const BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000';
+export const DISTRIBUTOR_KEY = 'tera_distributor_id';
+export class ApiError extends Error { constructor(public status: number, public code: string, message: string, public details?: unknown) { super(message); } }
+export function getCurrentDistributor(): string | null { return localStorage.getItem(DISTRIBUTOR_KEY); }
+export function setCurrentDistributor(id: string): void { localStorage.setItem(DISTRIBUTOR_KEY, id); }
+export async function api<T>({ method = 'GET', path, body, signal }: { method?: string; path: string; body?: unknown; signal?: AbortSignal }): Promise<T> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  const id = getCurrentDistributor(); if (id) headers['X-Distributor-Id'] = id;
+  const res = await fetch(`${BASE}${path}`, { method, headers, body: body !== undefined ? JSON.stringify(body) : undefined, signal });
+  if (!res.ok) { const p = await res.json().catch(() => ({})); throw new ApiError(res.status, p.code ?? 'unknown', p.message ?? res.statusText, p); }
+  return res.status === 204 ? (undefined as T) : res.json();
+}
+EOF
+W apps/distributor-portal/src/api/queryClient.ts <<'EOF'
+import { QueryClient } from '@tanstack/react-query';
+import { ApiError } from './client';
+export const queryClient = new QueryClient({ defaultOptions: { queries: { staleTime: 10_000, retry: (n, e) => (e instanceof ApiError && e.status < 500 ? false : n < 2) } } });
+EOF
+W apps/distributor-portal/src/main.tsx <<'EOF'
+import React from 'react';
+import ReactDOM from 'react-dom/client';
+import './index.css';
+import { AppProviders } from './app/AppProviders';
+import { PortalPage } from './modules/portal/PortalPage';
+ReactDOM.createRoot(document.getElementById('root')!).render(<React.StrictMode><AppProviders><PortalPage /></AppProviders></React.StrictMode>);
+EOF
+W apps/distributor-portal/src/app/AppProviders.tsx <<'EOF'
+import type { ReactNode } from 'react';
+import { QueryClientProvider } from '@tanstack/react-query';
+import { I18nProvider, type Locale } from '@tera/i18n';
+import { queryClient } from '../api/queryClient';
+const locale = (import.meta.env.VITE_DEFAULT_LOCALE as Locale) ?? 'am';
+export function AppProviders({ children }: { children: ReactNode }) {
+  return <I18nProvider initialLocale={locale}><QueryClientProvider client={queryClient}>{children}</QueryClientProvider></I18nProvider>;
+}
+EOF
+
+# Portal module — 4 tabs
+W apps/distributor-portal/src/modules/portal/types.ts <<'EOF'
+export type { PortalProfile, CatalogItem, PlaceOrderRequest, PlaceOrderResponse, PortalOrderSummary, PortalOrdersResponse, PortalOrderDetail, StatementResponse, DisputeRow, RaiseDisputeRequest } from '@tera/contracts';
+export type Tab = 'order' | 'track' | 'statements' | 'disputes';
+EOF
+W apps/distributor-portal/src/modules/portal/api.ts <<'EOF'
+import { api } from '../../api/client';
+import type { PortalProfile, CatalogItem, PlaceOrderRequest, PlaceOrderResponse, PortalOrdersResponse, StatementResponse, DisputeRow, RaiseDisputeRequest } from './types';
+export const portalKeys = {
+  all: ['portal'] as const, me: () => [...portalKeys.all, 'me'] as const, catalog: () => [...portalKeys.all, 'catalog'] as const,
+  orders: () => [...portalKeys.all, 'orders'] as const, statements: () => [...portalKeys.all, 'statements'] as const, disputes: () => [...portalKeys.all, 'disputes'] as const,
+};
+export const fetchMe = (signal?: AbortSignal) => api<PortalProfile>({ path: '/portal/v1/me', signal });
+export const fetchCatalog = (signal?: AbortSignal) => api<{ items: CatalogItem[] }>({ path: '/portal/v1/catalog', signal });
+export const placeOrder = (body: PlaceOrderRequest) => api<PlaceOrderResponse>({ method: 'POST', path: '/portal/v1/orders', body });
+export const fetchOrders = (signal?: AbortSignal) => api<PortalOrdersResponse>({ path: '/portal/v1/orders', signal });
+export const fetchStatements = (signal?: AbortSignal) => api<StatementResponse>({ path: '/portal/v1/statements', signal });
+export const raiseDispute = (body: RaiseDisputeRequest) => api<{ disputes: DisputeRow[] }>({ method: 'POST', path: '/portal/v1/disputes', body });
+export const fetchDisputes = (signal?: AbortSignal) => api<{ disputes: DisputeRow[] }>({ path: '/portal/v1/disputes', signal });
+EOF
+W apps/distributor-portal/src/modules/portal/hooks.ts <<'EOF'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { portalKeys, fetchMe, fetchCatalog, placeOrder, fetchOrders, fetchStatements, raiseDispute, fetchDisputes } from './api';
+import type { PlaceOrderRequest, RaiseDisputeRequest } from './types';
+export const useMe = () => useQuery({ queryKey: portalKeys.me(), queryFn: ({ signal }) => fetchMe(signal) });
+export const useCatalog = () => useQuery({ queryKey: portalKeys.catalog(), queryFn: ({ signal }) => fetchCatalog(signal) });
+export function usePlaceOrder() { const qc = useQueryClient(); return useMutation({ mutationFn: (b: PlaceOrderRequest) => placeOrder(b), onSuccess: () => { void qc.invalidateQueries({ queryKey: portalKeys.orders() }); void qc.invalidateQueries({ queryKey: portalKeys.me() }); void qc.invalidateQueries({ queryKey: portalKeys.statements() }); } }); }
+export const useOrders = () => useQuery({ queryKey: portalKeys.orders(), queryFn: ({ signal }) => fetchOrders(signal), refetchInterval: 30_000 });
+export const useStatements = () => useQuery({ queryKey: portalKeys.statements(), queryFn: ({ signal }) => fetchStatements(signal) });
+export const useDisputes = () => useQuery({ queryKey: portalKeys.disputes(), queryFn: ({ signal }) => fetchDisputes(signal) });
+export function useRaiseDispute() { const qc = useQueryClient(); return useMutation({ mutationFn: (b: RaiseDisputeRequest) => raiseDispute(b), onSuccess: () => qc.invalidateQueries({ queryKey: portalKeys.disputes() }) }); }
+EOF
+W apps/distributor-portal/src/modules/portal/components/DistributorSwitcher.tsx <<'EOF'
+import { useState } from 'react';
+import { useI18n } from '@tera/i18n';
+import { getCurrentDistributor, setCurrentDistributor } from '../../../api/client';
+const KNOWN = [
+  { id: 'seed-dist-1', name: 'Abebe Distribution' }, { id: 'seed-dist-2', name: 'Bole Wholesale Co.' },
+  { id: 'seed-dist-3', name: 'Kazanchis Distributors' }, { id: 'seed-dist-4', name: 'Sarbet Traders' }, { id: 'seed-dist-5', name: 'CMC Retailers' },
+];
+export function DistributorSwitcher() {
+  const { t } = useI18n(); const current = getCurrentDistributor() ?? KNOWN[0]!.id; const [open, setOpen] = useState(false);
+  const pick = (id: string) => { setCurrentDistributor(id); window.location.reload(); };
+  return (
+    <div className="relative">
+      <button onClick={() => setOpen((v) => !v)} className="text-sm px-3 py-1.5 rounded-md border border-border bg-surface hover:bg-bg">{t('portal.switcher.label')} ▾</button>
+      {open && <div className="absolute right-0 top-full mt-1 z-20 min-w-[220px] border border-border bg-surface rounded-md shadow-md">{KNOWN.map((d) => <button key={d.id} onClick={() => pick(d.id)} className={`block w-full text-left px-3 py-2 text-sm hover:bg-bg ${current === d.id ? 'font-medium bg-bg' : ''}`}>{d.name}</button>)}</div>}
+    </div>
+  );
+}
+EOF
+W apps/distributor-portal/src/modules/portal/tabs/OrderTab.tsx <<'EOF'
+import { useMemo, useState } from 'react';
+import { useI18n, formatETB } from '@tera/i18n';
+import { Button, EmptyState, Spinner } from '@tera/ui';
+import { useCatalog, useMe, usePlaceOrder } from '../hooks';
+import type { CatalogItem } from '../types';
+export function OrderTab() {
+  const { t } = useI18n();
+  const catalogQ = useCatalog(); const meQ = useMe(); const placeMut = usePlaceOrder();
+  const [cart, setCart] = useState<Map<string, number>>(new Map());
+  const [success, setSuccess] = useState<{ orderId: string; total: number } | null>(null);
+  const items = catalogQ.data?.items ?? []; const byId = useMemo(() => new Map(items.map((i) => [i.sku_id, i])), [items]);
+  const cartLines = useMemo(() => { const out: { item: CatalogItem; qty: number; subtotal: number }[] = []; for (const [id, qty] of cart) { const it = byId.get(id); if (it) out.push({ item: it, qty, subtotal: qty * it.unit_price_etb }); } return out; }, [cart, byId]);
+  const total = cartLines.reduce((s, l) => s + l.subtotal, 0); const headroom = meQ.data?.headroom_etb ?? 0;
+  const exceeds = total > headroom; const count = cartLines.reduce((s, l) => s + l.qty, 0);
+  const setQty = (id: string, q: number) => { const n = new Map(cart); if (q <= 0) n.delete(id); else n.set(id, q); setCart(n); setSuccess(null); };
+  if (catalogQ.isLoading || meQ.isLoading) return <div className="p-6"><Spinner label={t('common.loading')} /></div>;
+  if (catalogQ.isError || meQ.isError) return <div className="text-sm text-danger p-4">{t('common.error')}</div>;
+  return (
+    <div className="grid grid-cols-1 lg:grid-cols-[1fr_360px] gap-6">
+      <div>
+        <h2 className="text-sm font-semibold text-muted uppercase tracking-wide mb-3">{t('portal.order.catalog')}</h2>
+        {items.length === 0 ? <EmptyState title={t('portal.order.no_skus')} /> : (
+          <div className="flex flex-col gap-2">{items.map((it) => { const q = cart.get(it.sku_id) ?? 0; const tone = it.stock_on_hand === 0 ? 'text-danger' : it.stock_on_hand < 100 ? 'text-warn' : 'text-success';
+            return <div key={it.sku_id} className="border border-border rounded-md bg-surface p-3 flex items-center gap-3">
+              <div className="flex-1 min-w-0"><div className="font-medium">{it.name}</div>
+                <div className="text-xs text-muted">{it.code} · {formatETB(it.unit_price_etb)} / {it.unit} · <span className={tone}>{it.stock_on_hand} {t('portal.order.in_stock')}</span></div></div>
+              <div className="flex items-center gap-1">
+                <Button size="sm" variant="ghost" onClick={() => setQty(it.sku_id, q - 1)} disabled={q === 0}>−</Button>
+                <input type="number" min={0} max={it.stock_on_hand} value={q} onChange={(e) => setQty(it.sku_id, Math.min(it.stock_on_hand, Math.max(0, parseInt(e.target.value, 10) || 0)))} className="w-16 text-center rounded-md border border-border bg-bg px-2 py-1 text-sm tabular-nums" />
+                <Button size="sm" variant="ghost" onClick={() => setQty(it.sku_id, Math.min(it.stock_on_hand, q + 1))}>+</Button>
+              </div></div>; })}</div>
+        )}
+      </div>
+      <aside className="lg:sticky lg:top-4 self-start flex flex-col gap-3">
+        <div className="border border-border rounded-md bg-surface p-4">
+          <h2 className="text-sm font-semibold text-muted uppercase tracking-wide mb-3">{t('portal.order.cart')}</h2>
+          {cartLines.length === 0 ? <p className="text-sm text-muted">{t('portal.order.cart_empty')}</p> : (
+            <div className="flex flex-col gap-1.5 mb-3">{cartLines.map((l) => <div key={l.item.sku_id} className="flex justify-between text-sm"><span>{l.qty}× {l.item.name}</span><span className="tabular-nums">{formatETB(l.subtotal)}</span></div>)}</div>
+          )}
+          <div className="border-t border-border pt-2 flex justify-between font-medium"><span>{t('portal.order.total')}</span><span className="tabular-nums">{formatETB(total)}</span></div>
+        </div>
+        <div className={`rounded-md border p-4 ${exceeds ? 'border-danger/40 bg-dangerBg' : 'border-border bg-surface'}`}>
+          <p className="text-xs text-muted uppercase">{t('portal.order.headroom')}</p>
+          <p className={`text-xl font-bold tabular-nums ${exceeds ? 'text-danger' : ''}`}>{formatETB(headroom)}</p>
+          {count > 0 && <p className={`text-xs mt-1 ${exceeds ? 'text-danger font-medium' : 'text-muted'}`}>{exceeds ? t('portal.order.exceeds', { over: formatETB(total - headroom) }) : t('portal.order.after', { remaining: formatETB(headroom - total) })}</p>}
+        </div>
+        <Button size="lg" className="w-full" disabled={count === 0 || exceeds} loading={placeMut.isPending}
+          onClick={() => placeMut.mutate({ lines: cartLines.map((l) => ({ sku_id: l.item.sku_id, quantity: l.qty })) }, { onSuccess: (r) => { setSuccess({ orderId: r.order_id, total: r.total_etb }); setCart(new Map()); } })}>
+          {t('portal.order.place', { n: count })}
+        </Button>
+        {placeMut.isError && <div className="text-sm text-danger border border-danger/30 bg-dangerBg rounded px-3 py-2">{(placeMut.error as Error).message}</div>}
+        {success && <div className="text-sm text-success border border-success/30 bg-successBg rounded px-3 py-2">✓ {t('portal.order.success', { total: formatETB(success.total) })}</div>}
+      </aside>
+    </div>
+  );
+}
+EOF
+W apps/distributor-portal/src/modules/portal/tabs/TrackTab.tsx <<'EOF'
+import { useI18n, formatETB } from '@tera/i18n';
+import { EmptyState, Spinner, StatusPill } from '@tera/ui';
+import { useOrders } from '../hooks';
+import type { PortalOrderSummary } from '../types';
+function tone(s: PortalOrderSummary['status']): 'success' | 'warn' | 'danger' | 'neutral' { if (s === 'DELIVERED') return 'success'; if (s === 'ROUTED') return 'warn'; if (s === 'FAILED') return 'danger'; return 'neutral'; }
+export function TrackTab() {
+  const { t } = useI18n(); const q = useOrders();
+  if (q.isLoading) return <div className="p-6"><Spinner label={t('common.loading')} /></div>;
+  if (q.isError || !q.data) return <div className="text-sm text-danger p-4">{t('common.error')}</div>;
+  return (
+    <div className="flex flex-col gap-6">
+      <section><h2 className="text-sm font-semibold text-muted uppercase tracking-wide mb-3">{t('portal.track.active')} ({q.data.active.length})</h2>
+        {q.data.active.length === 0 ? <EmptyState title={t('portal.track.no_active')} hint={t('portal.track.no_active_hint')} /> :
+          <div className="flex flex-col gap-2">{q.data.active.map((o) => <Card key={o.order_id} order={o} />)}</div>}</section>
+      <section><h2 className="text-sm font-semibold text-muted uppercase tracking-wide mb-3">{t('portal.track.recent')} ({q.data.recent.length})</h2>
+        {q.data.recent.length === 0 ? <EmptyState title={t('portal.track.no_recent')} /> :
+          <div className="flex flex-col gap-2">{q.data.recent.map((o) => <Card key={o.order_id} order={o} compact />)}</div>}</section>
+    </div>
+  );
+}
+function Card({ order, compact }: { order: PortalOrderSummary; compact?: boolean }) {
+  const { t } = useI18n();
+  const eta = order.eta ? new Date(order.eta) : null;
+  return (
+    <div className={`border rounded-md bg-surface p-4 ${compact ? 'py-3' : ''}`}>
+      <div className="flex items-center justify-between flex-wrap gap-2">
+        <div><div className="font-medium text-sm font-mono">{order.order_id}</div>
+          <div className="text-xs text-muted mt-1">{new Date(order.created_at).toLocaleString()} · {order.line_count} {t('portal.track.lines')} · {order.total_quantity} {t('portal.track.items')}</div></div>
+        <div className="flex items-center gap-3"><span className="tabular-nums font-medium">{formatETB(order.total_etb)}</span><StatusPill tone={tone(order.status)}>{order.status}</StatusPill></div>
+      </div>
+      {eta && !compact && <div className="mt-3 pt-3 border-t border-border flex items-center justify-between text-sm">
+        <div><span className="text-muted">{t('portal.track.eta')}: </span><span className="font-medium">{eta.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+          {order.vehicle_id && <><span className="text-muted"> · {t('portal.track.vehicle')}: </span><span className="font-medium">{order.vehicle_id}</span></>}</div></div>}
+    </div>
+  );
+}
+EOF
+W apps/distributor-portal/src/modules/portal/tabs/StatementsTab.tsx <<'EOF'
+import { useI18n, formatETB } from '@tera/i18n';
+import { EmptyState, Spinner } from '@tera/ui';
+import { useStatements } from '../hooks';
+export function StatementsTab() {
+  const { t } = useI18n(); const q = useStatements();
+  if (q.isLoading) return <div className="p-6"><Spinner label={t('common.loading')} /></div>;
+  if (q.isError || !q.data) return <div className="text-sm text-danger p-4">{t('common.error')}</div>;
+  const s = q.data; const pct = s.limit_etb > 0 ? (s.balance_etb / s.limit_etb) * 100 : 0;
+  return (
+    <div className="flex flex-col gap-6">
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <Stat label={t('portal.statements.balance')} value={formatETB(s.balance_etb)} />
+        <Stat label={t('portal.statements.limit')} value={formatETB(s.limit_etb)} />
+        <Stat label={t('portal.statements.utilization')} value={`${pct.toFixed(0)}%`} danger={pct > 80} />
+        <Stat label={t('portal.statements.oldest_unpaid')} value={s.days_since_oldest_unpaid !== null ? `${s.days_since_oldest_unpaid}d` : '—'} danger={s.days_since_oldest_unpaid !== null && s.days_since_oldest_unpaid > s.grace_days} />
+      </div>
+      <section><h2 className="text-sm font-semibold text-muted uppercase tracking-wide mb-3">{t('portal.statements.recent_deliveries')}</h2>
+        {s.recent_deliveries.length === 0 ? <EmptyState title={t('portal.statements.no_deliveries')} /> : (
+          <div className="border border-border rounded-md bg-surface overflow-hidden">
+            <table className="w-full text-sm"><thead className="bg-bg border-b border-border"><tr>
+              <th className="text-left px-4 py-2 font-medium text-muted">{t('portal.statements.date')}</th>
+              <th className="text-left px-4 py-2 font-medium text-muted">{t('portal.statements.order')}</th>
+              <th className="text-left px-4 py-2 font-medium text-muted">{t('portal.statements.vehicle')}</th>
+              <th className="text-right px-4 py-2 font-medium text-muted">{t('portal.statements.qty')}</th>
+            </tr></thead><tbody>{s.recent_deliveries.map((d) => (
+              <tr key={d.order_id} className="border-b border-border last:border-0">
+                <td className="px-4 py-2 text-muted text-xs">{new Date(d.delivered_at).toLocaleString()}</td>
+                <td className="px-4 py-2 text-xs font-mono">{d.order_id}</td>
+                <td className="px-4 py-2">{d.vehicle_id}</td>
+                <td className="px-4 py-2 text-right tabular-nums">{d.total_quantity}</td>
+              </tr>
+            ))}</tbody></table>
+          </div>
+        )}</section>
+    </div>
+  );
+}
+function Stat({ label, value, danger }: { label: string; value: string; danger?: boolean }) {
+  return <div className="rounded-lg border border-border bg-surface px-4 py-3"><p className="text-xs text-muted uppercase">{label}</p><p className={`text-xl font-bold tabular-nums mt-1 ${danger ? 'text-danger' : ''}`}>{value}</p></div>;
+}
+EOF
+W apps/distributor-portal/src/modules/portal/tabs/DisputesTab.tsx <<'EOF'
+import { useState } from 'react';
+import { useI18n } from '@tera/i18n';
+import { Button, EmptyState, Spinner, StatusPill } from '@tera/ui';
+import { useOrders, useDisputes, useRaiseDispute } from '../hooks';
+import type { RaiseDisputeRequest } from '../types';
+type T = 'QUANTITY' | 'WRONG_ITEM' | 'NEVER_DELIVERED' | 'DAMAGED' | 'OTHER';
+const TYPES: T[] = ['QUANTITY', 'WRONG_ITEM', 'NEVER_DELIVERED', 'DAMAGED', 'OTHER'];
+export function DisputesTab() {
+  const { t } = useI18n(); const ordersQ = useOrders(); const disputesQ = useDisputes(); const raiseMut = useRaiseDispute();
+  const [orderId, setOrderId] = useState(''); const [type, setType] = useState<T>('QUANTITY'); const [desc, setDesc] = useState('');
+  const all = [...(ordersQ.data?.active ?? []), ...(ordersQ.data?.recent ?? [])];
+  const canSubmit = orderId && desc.trim().length >= 10;
+  const submit = () => { if (!canSubmit) return; const b: RaiseDisputeRequest = { order_id: orderId, type, description: desc.trim() }; raiseMut.mutate(b, { onSuccess: () => { setOrderId(''); setDesc(''); } }); };
+  return (
+    <div className="flex flex-col gap-6">
+      <section><h2 className="text-sm font-semibold text-muted uppercase tracking-wide mb-3">{t('portal.disputes.raise')}</h2>
+        <div className="border border-border rounded-md bg-surface p-4 flex flex-col gap-3">
+          <label className="text-sm"><span className="text-muted block mb-1">{t('portal.disputes.order')}</span>
+            <select value={orderId} onChange={(e) => setOrderId(e.target.value)} className="w-full rounded-md border border-border bg-bg px-3 py-2"><option value="">{t('portal.disputes.pick_order')}</option>
+              {all.map((o) => <option key={o.order_id} value={o.order_id}>{o.order_id} ({o.status}) — {o.total_quantity} items</option>)}</select></label>
+          <label className="text-sm"><span className="text-muted block mb-1">{t('portal.disputes.type')}</span>
+            <select value={type} onChange={(e) => setType(e.target.value as T)} className="w-full rounded-md border border-border bg-bg px-3 py-2">
+              {TYPES.map((tt) => <option key={tt} value={tt}>{t(`portal.disputes.type.${tt}`)}</option>)}</select></label>
+          <label className="text-sm"><span className="text-muted block mb-1">{t('portal.disputes.description')}</span>
+            <textarea value={desc} onChange={(e) => setDesc(e.target.value)} rows={3} className="w-full rounded-md border border-border bg-bg px-3 py-2" /></label>
+          {raiseMut.isError && <p className="text-sm text-danger">{(raiseMut.error as Error).message}</p>}
+          <div className="flex justify-end"><Button onClick={submit} disabled={!canSubmit} loading={raiseMut.isPending}>{t('portal.disputes.submit')}</Button></div>
+        </div></section>
+      <section><h2 className="text-sm font-semibold text-muted uppercase tracking-wide mb-3">{t('portal.disputes.past')} ({disputesQ.data?.disputes.length ?? 0})</h2>
+        {disputesQ.isLoading && <Spinner label={t('common.loading')} />}
+        {disputesQ.data && disputesQ.data.disputes.length === 0 && <EmptyState title={t('portal.disputes.empty')} />}
+        {disputesQ.data && disputesQ.data.disputes.length > 0 && <div className="flex flex-col gap-2">{disputesQ.data.disputes.map((d) => (
+          <div key={d.id} className="border border-border rounded-md bg-surface p-3">
+            <div className="flex items-center justify-between mb-1"><span className="font-medium text-sm">{t(`portal.disputes.type.${d.type}`)}</span><StatusPill tone={d.status === 'OPEN' ? 'warn' : d.status === 'RESOLVED' ? 'success' : 'neutral'}>{d.status}</StatusPill></div>
+            <div className="text-xs text-muted font-mono mb-1">{d.order_id}</div>
+            <p className="text-sm">{d.description}</p>
+            <p className="text-xs text-muted mt-1">{new Date(d.created_at).toLocaleString()}</p>
+          </div>
+        ))}</div>}
+      </section>
+    </div>
+  );
+}
+EOF
+W apps/distributor-portal/src/modules/portal/PortalPage.tsx <<'EOF'
+import { useState } from 'react';
+import { useI18n } from '@tera/i18n';
+import { Spinner } from '@tera/ui';
+import { DistributorSwitcher } from './components/DistributorSwitcher';
+import { OrderTab } from './tabs/OrderTab';
+import { TrackTab } from './tabs/TrackTab';
+import { StatementsTab } from './tabs/StatementsTab';
+import { DisputesTab } from './tabs/DisputesTab';
+import { useMe } from './hooks';
+import { getCurrentDistributor, setCurrentDistributor } from '../../api/client';
+import type { Tab } from './types';
+const TABS: { id: Tab; key: string }[] = [
+  { id: 'order', key: 'portal.tab.order' }, { id: 'track', key: 'portal.tab.track' },
+  { id: 'statements', key: 'portal.tab.statements' }, { id: 'disputes', key: 'portal.tab.disputes' },
+];
+export function PortalPage() {
+  const { t } = useI18n(); const [tab, setTab] = useState<Tab>('order');
+  if (!getCurrentDistributor()) setCurrentDistributor('seed-dist-1');
+  const meQ = useMe();
+  return (
+    <div className="min-h-full bg-bg">
+      <header className="border-b border-border bg-surface px-6 py-3"><div className="max-w-6xl mx-auto flex items-center gap-4 flex-wrap">
+        <div><p className="text-xs text-muted uppercase tracking-wide">{t('app.name')}</p><p className="text-lg font-bold">{t('portal.title')}</p></div>
+        <div className="ml-auto flex items-center gap-3">
+          {meQ.data && <div className="text-sm text-right"><div className="font-medium">{meQ.data.name}</div><div className="text-xs text-muted">{t('portal.headroom_short')}: {meQ.data.headroom_etb.toLocaleString()} ETB</div></div>}
+          <DistributorSwitcher />
+        </div>
+      </div></header>
+      <div className="border-b border-border bg-surface px-6"><div className="max-w-6xl mx-auto flex gap-1">
+        {TABS.map((tt) => <button key={tt.id} onClick={() => setTab(tt.id)} className={`px-4 py-3 text-sm font-medium border-b-2 transition ${tab === tt.id ? 'border-primary text-primary' : 'border-transparent text-muted hover:text-text'}`}>{t(tt.key)}</button>)}
+      </div></div>
+      <main className="p-6 max-w-6xl mx-auto">
+        {meQ.isLoading ? <Spinner label={t('common.loading')} /> : (
+          <>{tab === 'order' && <OrderTab />}{tab === 'track' && <TrackTab />}{tab === 'statements' && <StatementsTab />}{tab === 'disputes' && <DisputesTab />}</>
+        )}
+      </main>
+    </div>
+  );
+}
+EOF
+W apps/distributor-portal/src/modules/portal/index.ts <<'EOF'
+export { PortalPage } from './PortalPage';
+EOF
+
+# ═══════════════════════════════════════════════════════════════════
+# PHASE 9 — FINAL i18n consolidation (exec/finance/portal keys)
+# ═══════════════════════════════════════════════════════════════════
+echo "▸ Final i18n + smoke test + docs"
+
+node <<'NODE'
+const fs = require('fs');
+const en = JSON.parse(fs.readFileSync('packages/i18n/src/locales/en.json', 'utf8'));
+const am = JSON.parse(fs.readFileSync('packages/i18n/src/locales/am.json', 'utf8'));
+
+Object.assign(en, {
+  'exec.title': 'Executive Dashboard', 'exec.tagline': '90-second read', 'exec.heading': 'ROI Dashboard', 'exec.as_of': 'As of',
+  'exec.hero.label': 'Saved this month', 'exec.hero.per_month': 'per month',
+  'exec.hero.cumulative': 'Since baseline', 'exec.hero.annualized': 'Annualized pace',
+  'exec.hero.days': 'days', 'exec.hero.per_year': 'per year',
+  'exec.tiles.heading': 'The ten drivers', 'exec.tile.fully_in_target': 'Max target', 'exec.tile.in_target': 'Min target', 'exec.tile.below_target': 'Below target',
+  'exec.tile.etb_impact': 'monthly impact',
+  'exec.demo.title': 'Demo data',
+  'exec.demo.body': "These numbers come from synthetic demo data. When you're ready to start real tracking, freeze today's values as the baseline.",
+  'exec.demo.start': 'Start real baseline',
+  'exec.empty.no_baseline': 'No baseline frozen yet', 'exec.empty.no_baseline_hint': 'Press Start real baseline when ready.',
+  'exec.assumptions.title': 'Cost assumptions', 'exec.assumptions.configure': 'Configure cost assumptions',
+  'exec.assumption.monthly_deliveries': 'Monthly deliveries', 'exec.assumption.monthly_routes': 'Monthly routes',
+  'exec.assumption.daily_vehicles': 'Daily vehicles', 'exec.assumption.vehicle_wear': 'Vehicle wear (ETB/km)',
+  'exec.assumption.margin_sku': 'Margin per SKU-day (ETB)', 'exec.assumption.fuel_incident': 'Cost per fuel incident (ETB)',
+  'exec.assumption.margin_delivery': 'Margin per delivery (ETB)',
+
+  'finance.title': 'Finance', 'finance.tagline': 'Exposure · overrides · reconciliation',
+  'finance.heading': 'Finance Console', 'finance.heading_hint': 'Cash protection and reconciliation',
+  'finance.tab.credit': 'Credit', 'finance.tab.overrides': 'Overrides', 'finance.tab.reconciliation': 'Reconciliation',
+  'finance.credit.total_exposure': 'Total exposure', 'finance.credit.total_limit': 'Total limit',
+  'finance.credit.utilization': 'Utilization', 'finance.credit.over_limit': 'Over limit',
+  'finance.credit.aging_buckets': 'Aging buckets',
+  'finance.credit.bucket.current': 'Current', 'finance.credit.bucket.watch': 'Watch', 'finance.credit.bucket.overdue': 'Overdue', 'finance.credit.bucket.critical': 'Critical',
+  'finance.credit.accounts': 'accts', 'finance.credit.near_limit': 'Near limit (≥80%)', 'finance.credit.all_accounts': 'All accounts',
+  'finance.credit.no_accounts': 'No credit accounts yet',
+  'finance.credit.exposure': 'Exposure', 'finance.credit.limit': 'Limit', 'finance.credit.days_overdue': 'Days overdue', 'finance.credit.days_overdue_suffix': 'days overdue',
+  'finance.overrides.total': 'overrides recorded', 'finance.overrides.filter.active': 'Active', 'finance.overrides.filter.expired': 'Expired', 'finance.overrides.filter.all': 'All',
+  'finance.overrides.empty': 'No overrides to show', 'finance.overrides.reason': 'Reason', 'finance.overrides.actor': 'Actor',
+  'finance.overrides.created': 'Created', 'finance.overrides.expires': 'Expires',
+  'finance.overrides.status.active': 'Active', 'finance.overrides.status.expired': 'Expired',
+  'finance.recon.title': 'Unreconciled payments', 'finance.recon.subtitle': 'Cash and Telebirr payments awaiting reconciliation.',
+  'finance.recon.pending': 'pending', 'finance.recon.empty': 'No payments awaiting reconciliation',
+  'finance.recon.distributor': 'Distributor', 'finance.recon.vehicle': 'Vehicle', 'finance.recon.method': 'Method',
+  'finance.recon.amount': 'Amount', 'finance.recon.captured': 'Captured', 'finance.recon.reconcile': 'Reconcile',
+  'finance.recon.hint': 'Cash payments: verify driver count matches. Telebirr: match ref against the transaction log.',
+
+  'portal.title': 'Distributor Portal', 'portal.headroom_short': 'Headroom', 'portal.switcher.label': 'Switch distributor',
+  'portal.tab.order': 'Order', 'portal.tab.track': 'Track', 'portal.tab.statements': 'Statements', 'portal.tab.disputes': 'Disputes',
+  'portal.order.catalog': 'Product catalog', 'portal.order.no_skus': 'No products available', 'portal.order.in_stock': 'in stock',
+  'portal.order.cart': 'Your cart', 'portal.order.cart_empty': 'Cart is empty — add products on the left',
+  'portal.order.total': 'Total', 'portal.order.headroom': 'Credit headroom',
+  'portal.order.exceeds': 'Cart exceeds headroom by {over}', 'portal.order.after': '{remaining} will remain after order',
+  'portal.order.place': 'Place order ({n})', 'portal.order.success': 'Order placed · {total}',
+  'portal.track.active': 'Active orders', 'portal.track.no_active': 'No active orders', 'portal.track.no_active_hint': 'Place an order from the Order tab.',
+  'portal.track.recent': 'Recent', 'portal.track.no_recent': 'No recent orders yet',
+  'portal.track.lines': 'lines', 'portal.track.items': 'items', 'portal.track.eta': 'ETA', 'portal.track.vehicle': 'Vehicle',
+  'portal.statements.balance': 'Balance', 'portal.statements.limit': 'Credit limit',
+  'portal.statements.utilization': 'Utilization', 'portal.statements.oldest_unpaid': 'Oldest unpaid',
+  'portal.statements.recent_deliveries': 'Recent deliveries', 'portal.statements.no_deliveries': 'No deliveries yet',
+  'portal.statements.date': 'Date', 'portal.statements.order': 'Order', 'portal.statements.vehicle': 'Vehicle', 'portal.statements.qty': 'Qty',
+  'portal.disputes.raise': 'Raise a dispute', 'portal.disputes.order': 'Order', 'portal.disputes.pick_order': 'Choose an order…',
+  'portal.disputes.type': 'Issue type',
+  'portal.disputes.type.QUANTITY': 'Wrong quantity', 'portal.disputes.type.WRONG_ITEM': 'Wrong item',
+  'portal.disputes.type.NEVER_DELIVERED': 'Never delivered', 'portal.disputes.type.DAMAGED': 'Damaged', 'portal.disputes.type.OTHER': 'Other',
+  'portal.disputes.description': 'Description', 'portal.disputes.submit': 'Submit dispute',
+  'portal.disputes.past': 'Your disputes', 'portal.disputes.empty': 'No disputes raised yet',
+});
+
+Object.assign(am, {
+  'exec.title': 'የአስፈጻሚ ዳሽቦርድ', 'exec.tagline': 'የ90 ሰከንድ ንባብ', 'exec.heading': 'ROI ዳሽቦርድ', 'exec.as_of': 'እንደ',
+  'exec.hero.label': 'በዚህ ወር ቁጠባ', 'exec.hero.per_month': 'በወር', 'exec.hero.cumulative': 'ከመነሻ ጀምሮ', 'exec.hero.annualized': 'ዓመታዊ ፍጥነት',
+  'exec.hero.days': 'ቀናት', 'exec.hero.per_year': 'በዓመት',
+  'exec.tiles.heading': 'አሥሩ አንቀሳቃሾች', 'exec.tile.fully_in_target': 'ከፍተኛ ዒላማ', 'exec.tile.in_target': 'ዝቅተኛ ዒላማ', 'exec.tile.below_target': 'ከዒላማ በታች',
+  'exec.tile.etb_impact': 'ወርሃዊ ተጽዕኖ',
+  'exec.demo.title': 'የማሳያ ውሂብ', 'exec.demo.body': 'እነዚህ ቁጥሮች ከሰው ሰራሽ ውሂብ የመጡ ናቸው።',
+  'exec.demo.start': 'እውነተኛ መነሻ ጀምር',
+  'exec.empty.no_baseline': 'እስካሁን መነሻ አልተያዘም', 'exec.empty.no_baseline_hint': 'ዝግጁ ሲሆኑ ይጫኑ።',
+  'exec.assumptions.title': 'የወጪ ግምቶች', 'exec.assumptions.configure': 'የወጪ ግምቶችን አዋቅር',
+  'exec.assumption.monthly_deliveries': 'ወርሃዊ ማድረሶች', 'exec.assumption.monthly_routes': 'ወርሃዊ መንገዶች',
+  'exec.assumption.daily_vehicles': 'ዕለታዊ ተሽከርካሪዎች', 'exec.assumption.vehicle_wear': 'የተሽከርካሪ ልብስ',
+  'exec.assumption.margin_sku': 'ትርፍ በSKU-ቀን', 'exec.assumption.fuel_incident': 'ወጪ በነዳጅ ክስተት',
+  'exec.assumption.margin_delivery': 'ትርፍ በማድረስ',
+
+  'finance.title': 'ፋይናንስ', 'finance.tagline': 'ተጋላጭነት · ማለፍ · ማስታረቅ',
+  'finance.heading': 'የፋይናንስ ኮንሶል', 'finance.heading_hint': 'የገንዘብ ጥበቃ',
+  'finance.tab.credit': 'ክሬዲት', 'finance.tab.overrides': 'ማለፎች', 'finance.tab.reconciliation': 'ማስታረቅ',
+  'finance.credit.total_exposure': 'ጠቅላላ ተጋላጭነት', 'finance.credit.total_limit': 'ጠቅላላ ጣሪያ',
+  'finance.credit.utilization': 'አጠቃቀም', 'finance.credit.over_limit': 'ከጣሪያ በላይ',
+  'finance.credit.aging_buckets': 'የእድሜ ቅርጫቶች',
+  'finance.credit.bucket.current': 'የአሁን', 'finance.credit.bucket.watch': 'ክትትል', 'finance.credit.bucket.overdue': 'ያለፈ', 'finance.credit.bucket.critical': 'ወሳኝ',
+  'finance.credit.accounts': 'ሒሳቦች', 'finance.credit.near_limit': 'ወደ ጣሪያ ቅርብ', 'finance.credit.all_accounts': 'ሁሉም ሒሳቦች',
+  'finance.credit.no_accounts': 'ሒሳብ የለም',
+  'finance.credit.exposure': 'ተጋላጭነት', 'finance.credit.limit': 'ጣሪያ', 'finance.credit.days_overdue': 'የተዘገዩ ቀናት', 'finance.credit.days_overdue_suffix': 'ቀናት ዘግይተዋል',
+  'finance.overrides.total': 'ማለፎች', 'finance.overrides.filter.active': 'ንቁ', 'finance.overrides.filter.expired': 'ያለቀ', 'finance.overrides.filter.all': 'ሁሉም',
+  'finance.overrides.empty': 'ማለፍ የለም', 'finance.overrides.reason': 'ምክንያት', 'finance.overrides.actor': 'ተዋናይ',
+  'finance.overrides.created': 'የተፈጠረ', 'finance.overrides.expires': 'የሚያበቃ',
+  'finance.overrides.status.active': 'ንቁ', 'finance.overrides.status.expired': 'ያለቀ',
+  'finance.recon.title': 'ያልተስተካከሉ ክፍያዎች', 'finance.recon.subtitle': 'ማስታረቅ የሚጠብቁ ክፍያዎች',
+  'finance.recon.pending': 'በመጠባበቅ ላይ', 'finance.recon.empty': 'ክፍያ የለም',
+  'finance.recon.distributor': 'አከፋፋይ', 'finance.recon.vehicle': 'ተሽከርካሪ', 'finance.recon.method': 'ዘዴ',
+  'finance.recon.amount': 'መጠን', 'finance.recon.captured': 'የተያዘ', 'finance.recon.reconcile': 'አስታርቅ',
+  'finance.recon.hint': 'የጥሬ ገንዘብ ክፍያዎች፦ የሹፌሩ ቆጠራ መመሳሰሉን ያረጋግጡ።',
+
+  'portal.title': 'የአከፋፋይ ፖርታል', 'portal.headroom_short': 'ቀሪ ክሬዲት', 'portal.switcher.label': 'አከፋፋይ ቀይር',
+  'portal.tab.order': 'ትዕዛዝ', 'portal.tab.track': 'ክትትል', 'portal.tab.statements': 'መግለጫዎች', 'portal.tab.disputes': 'ክርክሮች',
+  'portal.order.catalog': 'የምርት ካታሎግ', 'portal.order.no_skus': 'ምርት የለም', 'portal.order.in_stock': 'በመጋዘን',
+  'portal.order.cart': 'የእርስዎ ጋሪ', 'portal.order.cart_empty': 'ጋሪው ባዶ ነው',
+  'portal.order.total': 'ጠቅላላ', 'portal.order.headroom': 'ቀሪ ክሬዲት',
+  'portal.order.exceeds': 'ጋሪው በ{over} ይበልጣል', 'portal.order.after': '{remaining} ይቀራል',
+  'portal.order.place': 'ትዕዛዝ አስገባ ({n})', 'portal.order.success': 'ትዕዛዝ ገብቷል · {total}',
+  'portal.track.active': 'ንቁ ትዕዛዞች', 'portal.track.no_active': 'ንቁ ትዕዛዝ የለም', 'portal.track.no_active_hint': 'ከትዕዛዝ ትር ትዕዛዝ ያስገቡ',
+  'portal.track.recent': 'የቅርብ ጊዜ', 'portal.track.no_recent': 'ትዕዛዝ የለም',
+  'portal.track.lines': 'መስመሮች', 'portal.track.items': 'ዕቃዎች', 'portal.track.eta': 'የመድረሻ ጊዜ', 'portal.track.vehicle': 'ተሽከርካሪ',
+  'portal.statements.balance': 'ቀሪ ሂሳብ', 'portal.statements.limit': 'የክሬዲት ጣሪያ',
+  'portal.statements.utilization': 'አጠቃቀም', 'portal.statements.oldest_unpaid': 'በጣም የቆየ',
+  'portal.statements.recent_deliveries': 'የቅርብ ማድረሶች', 'portal.statements.no_deliveries': 'ማድረስ የለም',
+  'portal.statements.date': 'ቀን', 'portal.statements.order': 'ትዕዛዝ', 'portal.statements.vehicle': 'ተሽከርካሪ', 'portal.statements.qty': 'ብዛት',
+  'portal.disputes.raise': 'ክርክር አቅርብ', 'portal.disputes.order': 'ትዕዛዝ', 'portal.disputes.pick_order': 'ትዕዛዝ ይምረጡ…',
+  'portal.disputes.type': 'የችግሩ ዓይነት',
+  'portal.disputes.type.QUANTITY': 'የተሳሳተ ብዛት', 'portal.disputes.type.WRONG_ITEM': 'የተሳሳተ ዕቃ',
+  'portal.disputes.type.NEVER_DELIVERED': 'አልደረሰም', 'portal.disputes.type.DAMAGED': 'ተበላሽቷል', 'portal.disputes.type.OTHER': 'ሌላ',
+  'portal.disputes.description': 'መግለጫ', 'portal.disputes.submit': 'ክርክር አስገባ',
+  'portal.disputes.past': 'የእርስዎ ክርክሮች', 'portal.disputes.empty': 'ክርክር አልቀረበም',
+});
+
+fs.writeFileSync('packages/i18n/src/locales/en.json', JSON.stringify(en, null, 2) + '\n');
+fs.writeFileSync('packages/i18n/src/locales/am.json', JSON.stringify(am, null, 2) + '\n');
+console.log('  i18n complete — exec + finance + portal keys added');
+NODE
+
+# ═══════════════════════════════════════════════════════════════════
+# PHASE 9 — SMOKE TEST
+# ═══════════════════════════════════════════════════════════════════
+echo "▸ Smoke test"
+
+W scripts/e2e/smoke-test.sh <<'SCRIPT'
+#!/usr/bin/env bash
+# Tera OMS — End-to-end smoke test
+set -uo pipefail
+API_URL="${API_URL:-http://localhost:8000}"
+DIST_ID="${DIST_ID:-seed-dist-1}"
+if [ -t 1 ]; then GREEN='\033[0;32m'; RED='\033[0;31m'; CYAN='\033[0;36m'; GRAY='\033[0;90m'; BOLD='\033[1m'; NC='\033[0m'; else GREEN=''; RED=''; CYAN=''; GRAY=''; BOLD=''; NC=''; fi
+P=0; F=0; FC=()
+section() { echo -e "\n${BOLD}${CYAN}▸ $1${NC}"; }
+check() {
+  local n="$1"; shift; echo -n "  $n ... "
+  if "$@" > /tmp/te 2>&1; then echo -e "${GREEN}✓${NC}"; P=$((P+1))
+  else echo -e "${RED}✗${NC}"; F=$((F+1)); FC+=("$n"); sed 's/^/      /' /tmp/te | head -10; fi
+}
+require() {
+  local n="$1"; shift
+  if ! check "$n" "$@"; then
+    echo -e "\n${RED}${BOLD}⛔ Aborted — $n failed${NC}"; echo -e "${GRAY}   Hint: pnpm db:migrate && pnpm db:seed${NC}"; summary
+  fi
+}
+summary() { echo -e "\n${BOLD}Passed:${NC} ${GREEN}$P${NC} | ${BOLD}Failed:${NC} ${RED}$F${NC}"; [ $F -gt 0 ] && { echo -e "${RED}Failed:${NC}"; for c in "${FC[@]}"; do echo -e "  - $c"; done; exit 1; }; echo -e "\n${GREEN}${BOLD}✓ ALL CHECKS PASSED${NC}"; exit 0; }
+
+get() { curl -sS --fail-with-body "$API_URL$1" -H 'Content-Type: application/json'; }
+post() { curl -sS --fail-with-body -X POST "$API_URL$1" -H 'Content-Type: application/json' -d "${2:-{\}}"; }
+post_d() { curl -sS --fail-with-body -X POST "$API_URL$1" -H 'Content-Type: application/json' -H "X-Distributor-Id: $3" -d "${2:-{\}}"; }
+
+t_health() { [ "$(get /health | jq -r '.ok')" = "true" ]; }
+t_credit() { [ "$(get /credit/v1/stop-list | jq '.rows | length')" -ge 1 ]; }
+t_exposure() { [ "$(get /credit/v1/exposure | jq '.aging_buckets | length')" = "4" ]; }
+t_zones() { [ "$(get '/geo/v1/curfew-zones?includeInactive=1' | jq '.zones | length')" -ge 3 ]; }
+t_stations() { [ "$(get '/geo/v1/fuel-stations?includeInactive=1' | jq '.stations | length')" -ge 3 ]; }
+t_orders() { [ "$(get /orders/v1/pending | jq '.orders | length')" -ge 2 ]; }
+t_vehicles() { [ "$(get /routing/v1/vehicles | jq '.vehicles | length')" -ge 1 ]; }
+t_routes() { [ "$(get /routing/v1/routes/today | jq '.routes | length')" -ge 1 ]; }
+t_board() { [ "$(get /dispatch/v1/board | jq '.docks | length')" -ge 1 ]; }
+t_catalog() { [ "$(get /portal/v1/catalog | jq '.items | length')" -ge 1 ]; }
+t_me() { [ "$(get /portal/v1/me -H "X-Distributor-Id: $DIST_ID" | jq -r '.distributor_id')" = "$DIST_ID" ]; }
+t_dashboard() { [ "$(get /analytics/v1/dashboard | jq '.tiles | length')" -ge 1 ]; }
+t_audit() { [ "$(get /audit/v1/log | jq '.entries | length')" -ge 0 ]; }
+t_notify() { [ "$(get /notify/v1/templates | jq '.templates | length')" -ge 1 ]; }
+t_jobs() { [ "$(get /admin/jobs/v1/schedule | jq '.jobs | length')" = "3" ]; }
+t_metrics() { get /metrics | grep -q 'tera_http_requests_total'; }
+
+# Solve flow
+t_sync_solve() {
+  local ids
+  ids=$(get /orders/v1/pending | jq -c '[.orders[].id] | .[0:3]')
+  [ "$(echo "$ids" | jq 'length')" -ge 3 ] || { echo "need 3 pending orders"; return 1; }
+  local result
+  result=$(post /routing/v1/solve "{\"order_ids\":$ids,\"vehicle_id\":\"V-103\"}")
+  [ "$(echo "$result" | jq '.optimized.stops | length')" -ge 3 ]
+}
+
+# Portal order flow
+NEW_ORDER=""
+t_place_order() {
+  local cat sku
+  cat=$(get /portal/v1/catalog); sku=$(echo "$cat" | jq -r '.items[0].sku_id')
+  [ -n "$sku" ] || { echo "no SKUs"; return 1; }
+  local resp
+  resp=$(post_d /portal/v1/orders "{\"lines\":[{\"sku_id\":\"$sku\",\"quantity\":3}]}" "$DIST_ID")
+  NEW_ORDER=$(echo "$resp" | jq -r '.order_id')
+  [ -n "$NEW_ORDER" ] || { echo "no order_id"; return 1; }
+}
+
+# Full flow: pick on V-102, confirm, dispatch
+t_pick_and_dispatch() {
+  local board route slot status picked
+  board=$(get /dispatch/v1/board)
+  route=$(echo "$board" | jq -r '[.docks[].slots[] | select(.route.vehicle_id == "V-102")][0].route.id // empty')
+  status=$(echo "$board" | jq -r '[.docks[].slots[] | select(.route.vehicle_id == "V-102")][0].status // empty')
+  [ -n "$route" ] || { echo "V-102 route not in board"; return 1; }
+  if [ "$status" = "ALLOCATED" ]; then
+    local pickList stops
+    pickList=$(get "/routing/v1/routes/$route/pick-list")
+    stops=$(echo "$pickList" | jq -r '.stops[].stop_id')
+    for sid in $stops; do post "/routing/v1/routes/$route/stops/$sid/picked" '{}' > /dev/null || return 1; done
+    slot=$(echo "$board" | jq -r '[.docks[].slots[] | select(.route.vehicle_id == "V-102")][0].id')
+    post "/dispatch/v1/slots/$slot/confirm" '{}' > /dev/null
+  fi
+  # dispatch
+  post "/dispatch/v1/routes/$route/dispatch" '{}' | jq -e '.status == "DISPATCHED"' > /dev/null
+}
+
+t_metrics_after() { get /metrics | grep -q 'tera_pending_orders'; }
+
+echo -e "${BOLD}╔══════════════════════════════════════════════════════════════╗${NC}"
+echo -e "${BOLD}║  Tera OMS — End-to-end Smoke Test                             ║${NC}"
+echo -e "${BOLD}╚══════════════════════════════════════════════════════════════╝${NC}"
+echo -e "${GRAY}  API: $API_URL  |  Distributor: $DIST_ID${NC}"
+
+section "1. Preflight"
+require "API is reachable" t_health
+
+section "2. Seed data"
+require "Credit stop list" t_credit
+require "Exposure with 4 aging buckets" t_exposure
+require "Curfew zones (≥3)" t_zones
+require "Fuel stations (≥3)" t_stations
+require "Pending orders (≥2)" t_orders
+require "Vehicles" t_vehicles
+require "Today's routes" t_routes
+require "Dispatch board" t_board
+
+section "3. Solve"
+require "Sync solve returns optimized route" t_sync_solve
+
+section "4. Dispatch flow"
+require "Pick all stops + dispatch V-102" t_pick_and_dispatch
+
+section "5. Portal"
+require "Catalog has SKUs" t_catalog
+require "GET /me returns distributor" t_me
+require "Place order via portal" t_place_order
+
+section "6. Analytics + Observability"
+require "Exec dashboard returns tiles" t_dashboard
+require "Audit log endpoint responds" t_audit
+require "Notify templates available" t_notify
+require "Job schedule (3 jobs)" t_jobs
+require "Prometheus /metrics contains counter" t_metrics
+require "Prometheus /metrics contains business gauge" t_metrics_after
+
+summary
+SCRIPT
+chmod +x scripts/e2e/smoke-test.sh
+
+# package.json + Makefile e2e entries
+node <<'NODE'
+const fs = require('fs');
+const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+pkg.scripts = pkg.scripts || {};
+pkg.scripts.e2e = 'bash scripts/e2e/smoke-test.sh';
+fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+const mk = fs.readFileSync('Makefile', 'utf8');
+if (!mk.includes('\ne2e:')) fs.writeFileSync('Makefile', mk.trimEnd() + '\n\ne2e:\n\tbash scripts/e2e/smoke-test.sh\n');
+console.log('  package.json + Makefile updated (+e2e)');
+NODE
+
+# Final README
+W README.md <<'EOF'
+# Tera OMS
+
+Optimization-first Order Management System for Ethiopian distribution.
+
+## Stack
+- **Backend:** Node 20 · TypeScript · Fastify · Prisma · MySQL 8 · Redis · BullMQ · node-cron
+- **Frontend:** React 18 · Vite 5 · Tailwind 3 · TanStack Query 5 · Leaflet · Expo (driver mobile)
+
+## Services (3)
+- `services/api` — 14 modules, ~95 endpoints, `/metrics`, `/docs` (Swagger)
+- `services/optimizer` — VRP worker (BullMQ consumer for async route solve)
+- `services/worker` — 3 nightly jobs (metric_snapshot, credit_rebuild, fuel_variance)
+
+## Frontends (8)
+| App | Port | Purpose |
+|---|---|---|
+| `dispatcher-web` | 5173 | Morning map · Route builder · Dispatch board · Credit stop list |
+| `driver-mobile` | Expo | Manifest · e-POD · Payment · Fuel · Sync (offline-first) |
+| `warehouse-web` | 5174 | Dock queue · Pick & stage |
+| `admin-web` | 5175 | Masterdata · Constraints · Audit · Notifications · Jobs · Monitoring |
+| `exec-web` | 5176 | ROI dashboard (hero + 10 tiles) |
+| `finance-web` | 5177 | Credit exposure · Overrides · Reconciliation |
+| `distributor-portal` | 5178 | Order · Track · Statements · Disputes |
+
+## Quick start
+```bash
+cp .env.example .env
+pnpm install
+docker compose up -d mysql redis
+pnpm db:generate && pnpm db:migrate && pnpm db:seed

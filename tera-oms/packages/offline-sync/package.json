@@ -1,0 +1,11 @@
+{
+  "name": "@tera/offline-sync",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": { "lint": "tsc --noEmit" },
+  "dependencies": { "@tera/contracts": "workspace:*" },
+  "devDependencies": { "typescript": "^5.4.0" }
+}

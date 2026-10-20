@@ -1,0 +1,7 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+@layer base {
+  html, body, #root { height: 100%; }
+  body { background-color: theme('colors.bg'); color: theme('colors.text'); font-family: theme('fontFamily.sans'); -webkit-font-smoothing: antialiased; }
+}

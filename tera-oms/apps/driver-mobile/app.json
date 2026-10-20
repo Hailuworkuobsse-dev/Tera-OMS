@@ -1,0 +1,12 @@
+{
+  "expo": {
+    "name": "Tera Driver",
+    "slug": "tera-driver",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "scheme": "teradriver",
+    "ios": { "bundleIdentifier": "et.tera.driver" },
+    "android": { "package": "et.tera.driver" },
+    "extra": { "apiUrl": "http://10.0.2.2:8000", "driverId": "D-201" }
+  }
+}
