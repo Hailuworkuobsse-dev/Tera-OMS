@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "vite --host 0.0.0.0 --port 3000",
     "build": "tsc -b && vite build",
     "test": "vitest run",
     "lint": "tsc --noEmit"
@@ -14,9 +14,9 @@
     "react-dom": "^18.3.0",
     "react-router-dom": "^6.24.0",
     "@tanstack/react-query": "^5.50.0",
-    "@tera/ui": "workspace:*",
-    "@tera/i18n": "workspace:*",
-    "@tera/contracts": "workspace:*",
+    "@tera/ui": "*",
+    "@tera/i18n": "*",
+    "@tera/contracts": "*",
     "leaflet": "^1.9.4",
     "react-leaflet": "^4.2.1"
   },
