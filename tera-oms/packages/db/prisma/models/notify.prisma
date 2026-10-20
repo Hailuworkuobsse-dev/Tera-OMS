@@ -1,6 +1,15 @@
-// ─────────────────────────────────────────────────────────
-// notify module — tables prefixed notify_
-// Owned by services/api/src/modules/notify/repository.ts
-// ─────────────────────────────────────────────────────────
+model NotificationLog {
+  id           String   @id @default(cuid())
+  channel      String   @db.VarChar(20)
+  recipient    String   @db.VarChar(200)
+  templateKey  String   @map("template_key") @db.VarChar(60)
+  renderedBody String   @map("rendered_body") @db.Text
+  status       String   @db.VarChar(20)
+  providerRef  String?  @map("provider_ref") @db.VarChar(100)
+  error        String?  @db.Text
+  sentAt       DateTime @default(now()) @map("sent_at")
 
-// (add models here as the module is built)
+  @@index([channel, sentAt])
+  @@index([status, sentAt])
+  @@map("notification_log")
+}

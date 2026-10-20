@@ -1,9 +1,7 @@
-/** @type {import('dependency-cruiser').IConfiguration} */
 module.exports = {
   forbidden: [
     {
       name: 'no-cross-module-repository',
-      comment: 'Each module may only import its OWN repository',
       severity: 'error',
       from: { path: '^services/api/src/modules/([^/]+)/' },
       to: {
@@ -13,7 +11,6 @@ module.exports = {
     },
     {
       name: 'core-cannot-import-modules',
-      comment: 'core and shared must be leaves',
       severity: 'error',
       from: { path: '^services/api/src/(core|shared)/' },
       to: { path: '^services/api/src/modules/' },

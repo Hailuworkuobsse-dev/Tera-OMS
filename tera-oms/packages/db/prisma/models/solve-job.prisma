@@ -1,0 +1,15 @@
+model SolveJob {
+  id           String    @id @default(cuid())
+  status       String    @db.VarChar(20) @default("QUEUED")
+  orderIdsJson Json      @map("order_ids_json")
+  vehicleId    String    @map("vehicle_id") @db.VarChar(100)
+  resultJson   Json?     @map("result_json")
+  error        String?   @db.Text
+  startedAt    DateTime? @map("started_at")
+  finishedAt   DateTime? @map("finished_at")
+  durationMs   Int?      @map("duration_ms")
+  createdAt    DateTime  @default(now()) @map("created_at")
+
+  @@index([status, createdAt])
+  @@map("routing_solve_job")
+}

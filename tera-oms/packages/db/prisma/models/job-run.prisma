@@ -1,0 +1,16 @@
+model JobRun {
+  id             String    @id @default(cuid())
+  jobKey         String    @map("job_key") @db.VarChar(60)
+  status         String    @db.VarChar(20) @default("RUNNING")
+  startedAt      DateTime  @default(now()) @map("started_at")
+  finishedAt     DateTime? @map("finished_at")
+  durationMs     Int?      @map("duration_ms")
+  processedCount Int       @default(0) @map("processed_count")
+  skippedCount   Int       @default(0) @map("skipped_count")
+  triggeredBy    String    @map("triggered_by") @db.VarChar(40) @default("schedule")
+  error          String?   @db.Text
+
+  @@index([jobKey, startedAt])
+  @@index([status, startedAt])
+  @@map("job_run")
+}

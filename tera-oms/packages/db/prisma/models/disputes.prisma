@@ -1,0 +1,16 @@
+model Dispute {
+  id              String    @id @default(cuid())
+  orderId         String    @map("order_id") @db.VarChar(100)
+  distributorId   String    @map("distributor_id") @db.VarChar(100)
+  type            String    @db.VarChar(40)
+  description     String    @db.Text
+  proofId         String?   @map("proof_id") @db.VarChar(100)
+  status          String    @db.VarChar(20) @default("OPEN")
+  resolutionNotes String?   @map("resolution_notes") @db.Text
+  createdAt       DateTime  @default(now()) @map("created_at")
+  resolvedAt      DateTime? @map("resolved_at")
+
+  @@index([distributorId, createdAt])
+  @@index([status])
+  @@map("dispute")
+}

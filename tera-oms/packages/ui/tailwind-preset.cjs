@@ -1,5 +1,4 @@
 const tokens = require('./src/tokens.json');
-/** @type {import('tailwindcss').Config} */
 module.exports = {
   theme: {
     extend: {

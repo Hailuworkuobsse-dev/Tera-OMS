@@ -1,0 +1,18 @@
+model Payment {
+  id             String    @id @default(cuid())
+  routeStopId    String    @map("route_stop_id") @db.VarChar(100)
+  orderId        String?   @map("order_id") @db.VarChar(100)
+  method         String    @db.VarChar(20)
+  amountEtb      Decimal   @map("amount_etb") @db.Decimal(14, 2)
+  telebirrRef    String?   @unique @map("telebirr_ref") @db.VarChar(60)
+  clientOpId     String    @unique @map("client_op_id") @db.VarChar(80)
+  capturedAt     DateTime  @map("captured_at")
+  receivedAt     DateTime  @default(now()) @map("received_at")
+  reconciledAt   DateTime? @map("reconciled_at")
+  reconciledBy   String?   @map("reconciled_by") @db.VarChar(100)
+  reconcileNotes String?   @map("reconcile_notes") @db.Text
+
+  @@index([routeStopId, capturedAt])
+  @@index([reconciledAt, receivedAt])
+  @@map("payment")
+}

@@ -1,6 +1,53 @@
-// ─────────────────────────────────────────────────────────
-// sync module — tables prefixed sync_
-// Owned by services/api/src/modules/sync/repository.ts
-// ─────────────────────────────────────────────────────────
+model SyncClient {
+  id             String   @id @default(cuid())
+  deviceId       String   @unique @map("device_id") @db.VarChar(200)
+  driverId       String   @map("driver_id") @db.VarChar(100)
+  lastPullCursor BigInt   @default(0) @map("last_pull_cursor")
+  lastSeenAt     DateTime @default(now()) @map("last_seen_at")
+  createdAt      DateTime @default(now()) @map("created_at")
 
-// (add models here as the module is built)
+  @@index([driverId])
+  @@map("sync_client")
+}
+
+model SyncChangeLog {
+  id            BigInt   @id @default(autoincrement())
+  entityType    String   @map("entity_type") @db.VarChar(40)
+  entityId      String   @map("entity_id")   @db.VarChar(100)
+  op            String   @db.VarChar(10)
+  payloadJson   Json     @map("payload_json") @db.Text
+  scopeDriverId String?  @map("scope_driver_id") @db.VarChar(100)
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  @@index([id])
+  @@index([scopeDriverId, id])
+  @@map("sync_change_log")
+}
+
+model SyncOpLog {
+  id         String   @id @default(cuid())
+  clientOpId String   @unique @map("client_op_id") @db.VarChar(80)
+  clientId   String   @map("client_id")
+  opType     String   @map("op_type") @db.VarChar(40)
+  resultJson Json     @map("result_json") @db.Text
+  appliedAt  DateTime @default(now()) @map("applied_at")
+
+  @@index([clientId, appliedAt])
+  @@map("sync_op_log")
+}
+
+model SyncConflict {
+  id             String    @id @default(cuid())
+  clientId       String    @map("client_id")
+  clientOpId     String    @map("client_op_id") @db.VarChar(80)
+  entityType     String    @map("entity_type") @db.VarChar(40)
+  entityId       String    @map("entity_id") @db.VarChar(100)
+  reason         String    @db.VarChar(200)
+  serverSnapshot Json      @map("server_snapshot") @db.Text
+  clientSnapshot Json      @map("client_snapshot") @db.Text
+  resolvedAt     DateTime? @map("resolved_at")
+  createdAt      DateTime  @default(now()) @map("created_at")
+
+  @@index([resolvedAt, createdAt])
+  @@map("sync_conflict")
+}

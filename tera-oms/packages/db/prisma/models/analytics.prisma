@@ -1,6 +1,33 @@
-// ─────────────────────────────────────────────────────────
-// analytics module — tables prefixed analytics_
-// Owned by services/api/src/modules/analytics/repository.ts
-// ─────────────────────────────────────────────────────────
+model Baseline {
+  id       String   @id @default(cuid())
+  key      String   @unique @db.VarChar(60)
+  value    Float
+  unit     String   @db.VarChar(20)
+  notes    String?  @db.Text
+  frozenAt DateTime @map("frozen_at")
+  frozenBy String   @map("frozen_by") @db.VarChar(100)
 
-// (add models here as the module is built)
+  @@map("analytics_baseline")
+}
+
+model MetricSnapshot {
+  id        String   @id @default(cuid())
+  date      DateTime @db.Date
+  key       String   @db.VarChar(60)
+  value     Float
+  metaJson  Json?    @map("meta_json")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@unique([date, key])
+  @@index([key, date])
+  @@map("analytics_metric_snapshot")
+}
+
+model CostAssumption {
+  key       String   @id @db.VarChar(60)
+  value     Float
+  unit      String   @db.VarChar(20)
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("analytics_cost_assumption")
+}

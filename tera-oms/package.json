@@ -8,9 +8,9 @@
     "build": "pnpm -r build",
     "lint": "pnpm -r lint",
     "test": "pnpm -r test",
+    "e2e": "bash scripts/e2e/smoke-test.sh",
     "db:generate": "pnpm --filter @tera/db generate",
     "db:migrate": "pnpm --filter @tera/db migrate",
-    "db:deploy": "pnpm --filter @tera/db deploy",
     "db:seed": "pnpm --filter @tera/db seed",
     "db:studio": "pnpm --filter @tera/db studio",
     "boundaries": "depcruise --config .dependency-cruiser.cjs services/api/src"

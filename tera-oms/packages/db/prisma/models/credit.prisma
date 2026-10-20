@@ -1,6 +1,49 @@
-// ─────────────────────────────────────────────────────────
-// credit module — tables prefixed credit_
-// Owned by services/api/src/modules/credit/repository.ts
-// ─────────────────────────────────────────────────────────
+model CreditAccount {
+  id             String    @id @default(cuid())
+  distributorId  String    @unique @map("distributor_id")
+  limitEtb       Decimal   @map("limit_etb") @db.Decimal(14, 2)
+  graceDays      Int       @default(14) @map("grace_days")
+  exposureEtb    Decimal   @default(0) @map("exposure_etb") @db.Decimal(14, 2)
+  oldestUnpaidAt DateTime? @map("oldest_unpaid_at")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
 
-// (add models here as the module is built)
+  distributor Distributor      @relation(fields: [distributorId], references: [id])
+  decisions   CreditDecision[]
+  overrides   CreditOverride[]
+
+  @@map("credit_account")
+}
+
+model CreditDecision {
+  id          String   @id @default(cuid())
+  accountId   String   @map("account_id")
+  orderId     String?  @map("order_id")
+  outcome     String   @db.VarChar(16)
+  reason      String   @db.VarChar(32)
+  exposureEtb Decimal  @map("exposure_etb") @db.Decimal(14, 2)
+  limitEtb    Decimal  @map("limit_etb") @db.Decimal(14, 2)
+  daysOverdue Int      @map("days_overdue")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  account   CreditAccount    @relation(fields: [accountId], references: [id])
+  overrides CreditOverride[]
+
+  @@index([accountId, createdAt])
+  @@map("credit_decision")
+}
+
+model CreditOverride {
+  id            String   @id @default(cuid())
+  decisionId    String?  @map("decision_id")
+  distributorId String   @map("distributor_id")
+  reason        String   @db.Text
+  actorId       String   @map("actor_id")
+  expiresAt     DateTime @map("expires_at")
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  decision CreditDecision? @relation(fields: [decisionId], references: [id])
+
+  @@index([distributorId, expiresAt])
+  @@map("credit_override")
+}

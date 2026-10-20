@@ -1,6 +1,44 @@
-// ─────────────────────────────────────────────────────────
-// routing module — tables prefixed routing_
-// Owned by services/api/src/modules/routing/repository.ts
-// ─────────────────────────────────────────────────────────
+model RoutePlan {
+  id         String   @id @default(cuid())
+  date       DateTime @db.Date
+  vehicleId  String   @map("vehicle_id")
+  driverId   String   @map("driver_id")
+  status     String   @db.VarChar(20) @default("PLANNED")
+  version    Int      @default(1)
+  plannedKm  Decimal  @map("planned_km") @db.Decimal(8, 2)
+  plannedMin Int      @map("planned_min")
+  startLat   Decimal  @map("start_lat") @db.Decimal(10, 7)
+  startLng   Decimal  @map("start_lng") @db.Decimal(10, 7)
+  baselineKm Decimal? @map("baseline_km") @db.Decimal(8, 2)
+  createdAt  DateTime @default(now()) @map("created_at")
 
-// (add models here as the module is built)
+  stops RouteStop[]
+
+  @@unique([date, vehicleId, version])
+  @@index([date, status])
+  @@index([driverId, date])
+  @@map("routing_route_plan")
+}
+
+model RouteStop {
+  id              String    @id @default(cuid())
+  routePlanId     String    @map("route_plan_id")
+  orderId         String?   @map("order_id")
+  seq             Int
+  distributorId   String    @map("distributor_id")
+  distributorName String    @map("distributor_name") @db.VarChar(200)
+  lat             Decimal   @db.Decimal(10, 7)
+  lng             Decimal   @db.Decimal(10, 7)
+  plannedEta      DateTime  @map("planned_eta")
+  actualArrival   DateTime? @map("actual_arrival")
+  status          String    @db.VarChar(20) @default("PENDING")
+  statusUpdatedAt DateTime  @default(now()) @map("status_updated_at")
+  quantityOrdered Int       @default(0) @map("quantity_ordered")
+  pickedAt        DateTime? @map("picked_at")
+
+  routePlan RoutePlan @relation(fields: [routePlanId], references: [id], onDelete: Cascade)
+
+  @@unique([routePlanId, seq])
+  @@index([status])
+  @@map("routing_route_stop")
+}

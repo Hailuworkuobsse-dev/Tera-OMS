@@ -1,6 +1,37 @@
-// ─────────────────────────────────────────────────────────
-// orders module — tables prefixed orders_
-// Owned by services/api/src/modules/orders/repository.ts
-// ─────────────────────────────────────────────────────────
+model Order {
+  id              String    @id @default(cuid())
+  distributorId   String    @map("distributor_id")
+  distributorName String    @map("distributor_name") @db.VarChar(200)
+  lat             Decimal   @db.Decimal(10, 7)
+  lng             Decimal   @db.Decimal(10, 7)
+  weightKg        Decimal   @map("weight_kg") @db.Decimal(8, 2)
+  volumeM3        Decimal   @map("volume_m3") @db.Decimal(8, 3)
+  priority        Int       @default(5)
+  timeWindowStart DateTime  @map("time_window_start")
+  timeWindowEnd   DateTime  @map("time_window_end")
+  status          String    @db.VarChar(20) @default("PENDING")
+  totalQuantity   Int       @default(0) @map("total_quantity")
+  createdAt       DateTime  @default(now()) @map("created_at")
 
-// (add models here as the module is built)
+  lines OrderLine[]
+
+  @@index([status])
+  @@index([distributorId, createdAt])
+  @@map("orders_order")
+}
+
+model OrderLine {
+  id        String   @id @default(cuid())
+  orderId   String   @map("order_id")
+  skuId     String   @map("sku_id") @db.VarChar(100)
+  skuCode   String   @map("sku_code") @db.VarChar(40)
+  skuName   String   @map("sku_name") @db.VarChar(200)
+  quantity  Int
+  unitPrice Decimal  @map("unit_price") @db.Decimal(14, 2)
+  lineTotal Decimal  @map("line_total") @db.Decimal(14, 2)
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+  @@map("orders_order_line")
+}

@@ -1,6 +1,29 @@
-// ─────────────────────────────────────────────────────────
-// dispatch module — tables prefixed dispatch_
-// Owned by services/api/src/modules/dispatch/repository.ts
-// ─────────────────────────────────────────────────────────
+model DispatchDock {
+  id        String   @id @default(cuid())
+  name      String   @db.VarChar(100)
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now()) @map("created_at")
 
-// (add models here as the module is built)
+  slots DispatchDockSlot[]
+
+  @@map("dispatch_dock")
+}
+
+model DispatchDockSlot {
+  id          String    @id @default(cuid())
+  dockId      String    @map("dock_id")
+  date        DateTime  @db.Date
+  startAt     DateTime  @map("start_at")
+  endAt       DateTime  @map("end_at")
+  status      String    @db.VarChar(20) @default("AVAILABLE")
+  routePlanId String?   @unique @map("route_plan_id")
+  confirmedAt DateTime? @map("confirmed_at")
+  confirmedBy String?   @map("confirmed_by")
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  dock DispatchDock @relation(fields: [dockId], references: [id])
+
+  @@index([date, status])
+  @@index([dockId, date])
+  @@map("dispatch_dock_slot")
+}

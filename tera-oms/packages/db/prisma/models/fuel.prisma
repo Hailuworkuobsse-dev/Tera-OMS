@@ -1,0 +1,19 @@
+model FuelLog {
+  id            String   @id @default(cuid())
+  driverId      String   @map("driver_id") @db.VarChar(100)
+  vehicleId     String   @map("vehicle_id") @db.VarChar(100)
+  liters        Decimal  @db.Decimal(8, 2)
+  amountEtb     Decimal  @map("amount_etb") @db.Decimal(14, 2)
+  odometerKm    Decimal  @map("odometer_km") @db.Decimal(12, 2)
+  stationName   String   @map("station_name") @db.VarChar(100)
+  stationId     String?  @map("station_id") @db.VarChar(100)
+  varianceFlag  String   @map("variance_flag") @db.VarChar(20) @default("NO_BASELINE")
+  varianceRatio Decimal? @map("variance_ratio") @db.Decimal(6, 3)
+  clientOpId    String   @unique @map("client_op_id") @db.VarChar(80)
+  capturedAt    DateTime @map("captured_at")
+  receivedAt    DateTime @default(now()) @map("received_at")
+
+  @@index([vehicleId, capturedAt])
+  @@index([varianceFlag, receivedAt])
+  @@map("fuel_log")
+}

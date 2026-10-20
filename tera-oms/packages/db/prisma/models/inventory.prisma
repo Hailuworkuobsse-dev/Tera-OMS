@@ -1,6 +1,0 @@
-// ─────────────────────────────────────────────────────────
-// inventory module — tables prefixed inventory_
-// Owned by services/api/src/modules/inventory/repository.ts
-// ─────────────────────────────────────────────────────────
-
-// (add models here as the module is built)

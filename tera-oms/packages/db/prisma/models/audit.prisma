@@ -1,6 +1,15 @@
-// ─────────────────────────────────────────────────────────
-// audit module — tables prefixed audit_
-// Owned by services/api/src/modules/audit/repository.ts
-// ─────────────────────────────────────────────────────────
+model AuditLog {
+  id        String   @id @default(cuid())
+  actorId   String   @map("actor_id") @db.VarChar(100)
+  entity    String   @db.VarChar(40)
+  entityId  String   @map("entity_id") @db.VarChar(100)
+  action    String   @db.VarChar(40)
+  reason    String   @db.Text
+  metaJson  Json?    @map("meta_json")
+  createdAt DateTime @default(now()) @map("created_at")
 
-// (add models here as the module is built)
+  @@index([entity, createdAt])
+  @@index([actorId, createdAt])
+  @@index([createdAt])
+  @@map("audit_log")
+}

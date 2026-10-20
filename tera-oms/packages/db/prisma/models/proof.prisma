@@ -1,0 +1,17 @@
+model ProofOfDelivery {
+  id              String   @id @default(cuid())
+  routeStopId     String   @map("route_stop_id") @db.VarChar(100)
+  orderId         String?  @map("order_id") @db.VarChar(100)
+  outcome         String   @db.VarChar(20)
+  qtyConfirmed    Int?     @map("qty_confirmed")
+  qtyOrdered      Int?     @map("qty_ordered")
+  reason          String?  @db.Text
+  signatureBase64 String?  @map("signature_base64") @db.MediumText
+  photoBase64     String?  @map("photo_base64")     @db.MediumText
+  clientOpId      String   @unique @map("client_op_id") @db.VarChar(80)
+  capturedAt      DateTime @map("captured_at")
+  receivedAt      DateTime @default(now()) @map("received_at")
+
+  @@index([routeStopId, capturedAt])
+  @@map("proof_of_delivery")
+}

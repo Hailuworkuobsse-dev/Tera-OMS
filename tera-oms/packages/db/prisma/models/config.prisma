@@ -1,6 +1,7 @@
-// ─────────────────────────────────────────────────────────
-// config module — tables prefixed config_
-// Owned by services/api/src/modules/config/repository.ts
-// ─────────────────────────────────────────────────────────
+model Setting {
+  key       String   @id @db.VarChar(100)
+  value     String   @db.Text
+  updatedAt DateTime @updatedAt @map("updated_at")
 
-// (add models here as the module is built)
+  @@map("config_setting")
+}

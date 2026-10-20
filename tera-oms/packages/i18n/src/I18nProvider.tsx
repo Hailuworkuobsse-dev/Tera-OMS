@@ -22,7 +22,6 @@ export function I18nProvider({ children, initialLocale = 'am' }: { children: Rea
   }, [locale]);
   return <I18nContext.Provider value={value}>{children}</I18nContext.Provider>;
 }
-
 export function useI18n(): Ctx {
   const ctx = useContext(I18nContext);
   if (!ctx) throw new Error('useI18n must be used inside <I18nProvider>');

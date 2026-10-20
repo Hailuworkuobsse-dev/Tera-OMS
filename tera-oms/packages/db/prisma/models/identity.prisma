@@ -1,6 +1,1 @@
-// ─────────────────────────────────────────────────────────
-// identity module — tables prefixed identity_
-// Owned by services/api/src/modules/identity/repository.ts
-// ─────────────────────────────────────────────────────────
-
-// (add models here as the module is built)
+// (reserved for Phase 7 JWT) — current auth uses headers + tokens

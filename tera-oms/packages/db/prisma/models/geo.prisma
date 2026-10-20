@@ -1,6 +1,29 @@
-// ─────────────────────────────────────────────────────────
-// geo module — tables prefixed geo_
-// Owned by services/api/src/modules/geo/repository.ts
-// ─────────────────────────────────────────────────────────
+model CurfewZone {
+  id          String   @id @default(cuid())
+  name        String   @db.VarChar(200)
+  polygonJson Json     @map("polygon_json")
+  startHour   Int      @map("start_hour")
+  endHour     Int      @map("end_hour")
+  reason      String   @db.VarChar(200)
+  active      Boolean  @default(true)
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
 
-// (add models here as the module is built)
+  @@index([active])
+  @@map("geo_curfew_zone")
+}
+
+model FuelStation {
+  id              String   @id @default(cuid())
+  name            String   @db.VarChar(200)
+  lat             Decimal  @db.Decimal(10, 7)
+  lng             Decimal  @db.Decimal(10, 7)
+  status          String   @db.VarChar(20) @default("operational")
+  statusUpdatedBy String?  @map("status_updated_by") @db.VarChar(100)
+  active          Boolean  @default(true)
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  @@index([active, status])
+  @@map("geo_fuel_station")
+}

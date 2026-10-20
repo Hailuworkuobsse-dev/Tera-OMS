@@ -1,6 +1,54 @@
-// ─────────────────────────────────────────────────────────
-// masterdata module — tables prefixed masterdata_
-// Owned by services/api/src/modules/masterdata/repository.ts
-// ─────────────────────────────────────────────────────────
+model Distributor {
+  id        String   @id @default(cuid())
+  name      String   @db.VarChar(200)
+  region    String   @db.VarChar(100)
+  lat       Decimal? @db.Decimal(10, 7)
+  lng       Decimal? @db.Decimal(10, 7)
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
 
-// (add models here as the module is built)
+  creditAccounts CreditAccount[]
+
+  @@index([region])
+  @@index([active])
+  @@map("masterdata_distributor")
+}
+
+model Vehicle {
+  id                String   @id @default(cuid())
+  plate             String   @unique @db.VarChar(20)
+  capacityKg        Decimal  @map("capacity_kg") @db.Decimal(8, 2)
+  capacityM3        Decimal  @map("capacity_m3") @db.Decimal(8, 3)
+  shiftStartH       Int      @map("shift_start_h")
+  shiftEndH         Int      @map("shift_end_h")
+  startLat          Decimal  @map("start_lat") @db.Decimal(10, 7)
+  startLng          Decimal  @map("start_lng") @db.Decimal(10, 7)
+  baselineLPer100Km Decimal? @map("baseline_l_per_100km") @db.Decimal(6, 2)
+  active            Boolean  @default(true)
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @default(now()) @updatedAt @map("updated_at")
+
+  @@index([active])
+  @@map("masterdata_vehicle")
+}
+
+model Sku {
+  id           String   @id @default(cuid())
+  code         String   @unique @db.VarChar(40)
+  name         String   @db.VarChar(200)
+  unit         String   @db.VarChar(20)
+  weightKg     Decimal  @map("weight_kg") @db.Decimal(8, 3)
+  volumeM3     Decimal  @map("volume_m3") @db.Decimal(8, 4)
+  unitPriceEtb Decimal  @default(0) @map("unit_price_etb") @db.Decimal(14, 2)
+  stockOnHand  Int      @default(0) @map("stock_on_hand")
+  reorderPoint Int      @default(0) @map("reorder_point")
+  safetyStock  Int      @default(0) @map("safety_stock")
+  leadTimeDays Int      @default(0) @map("lead_time_days")
+  active       Boolean  @default(true)
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @default(now()) @updatedAt @map("updated_at")
+
+  @@index([active])
+  @@map("masterdata_sku")
+}

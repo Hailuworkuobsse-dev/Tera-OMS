@@ -1,6 +1,0 @@
-// ─────────────────────────────────────────────────────────
-// fleet module — tables prefixed fleet_
-// Owned by services/api/src/modules/fleet/repository.ts
-// ─────────────────────────────────────────────────────────
-
-// (add models here as the module is built)

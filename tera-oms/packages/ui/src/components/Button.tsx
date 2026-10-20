@@ -1,12 +1,9 @@
 import type { ButtonHTMLAttributes, ReactNode } from 'react';
-
 type Variant = 'primary' | 'secondary' | 'danger' | 'ghost';
 type Size = 'sm' | 'md' | 'lg';
-
 interface Props extends ButtonHTMLAttributes<HTMLButtonElement> {
   variant?: Variant; size?: Size; loading?: boolean; children: ReactNode;
 }
-
 const base = 'inline-flex items-center justify-center font-medium rounded-md transition disabled:opacity-50 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary';
 const v: Record<Variant, string> = {
   primary: 'bg-primary text-white hover:bg-primaryHover',
@@ -19,7 +16,6 @@ const s: Record<Size, string> = {
   md: 'text-sm px-4 py-2 gap-2',
   lg: 'text-base px-6 py-3 gap-2',
 };
-
 export function Button({ variant = 'primary', size = 'md', loading = false, disabled, children, className = '', ...rest }: Props) {
   return (
     <button {...rest} disabled={disabled || loading} className={`${base} ${v[variant]} ${s[size]} ${className}`}>
