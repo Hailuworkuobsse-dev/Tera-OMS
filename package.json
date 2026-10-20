@@ -1,20 +1,19 @@
 {
   "name": "tera-oms",
   "private": true,
-  "packageManager": "pnpm@9.0.0",
   "engines": {
     "node": ">=20"
   },
+  "workspaces": [
+    "apps/*",
+    "packages/*",
+    "services/*"
+  ],
   "scripts": {
-    "dev": "pnpm -r --parallel dev",
-    "build": "pnpm -r build",
-    "lint": "pnpm -r lint",
-    "test": "pnpm -r test",
-    "e2e": "bash scripts/e2e/smoke-test.sh",
-    "db:generate": "pnpm --filter @tera/db generate",
-    "db:migrate": "pnpm --filter @tera/db migrate",
-    "db:seed": "pnpm --filter @tera/db seed",
-    "db:studio": "pnpm --filter @tera/db studio",
+    "dev": "npm run dev --workspace=dispatcher-web",
+    "build": "npm run build --workspace=dispatcher-web",
+    "lint": "npm run lint --workspace=dispatcher-web",
+    "test": "npm run test --workspace=dispatcher-web",
     "boundaries": "depcruise --config .dependency-cruiser.cjs services/api/src"
   },
   "devDependencies": {

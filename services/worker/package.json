@@ -1,6 +1,6 @@
 {
   "name": "@tera/worker", "version": "0.1.0", "private": true, "type": "module",
   "scripts": { "dev": "tsx watch src/main.ts", "build": "tsc -b", "start": "node dist/main.js", "lint": "tsc --noEmit", "test": "vitest run" },
-  "dependencies": { "@tera/db": "workspace:*", "bullmq": "^5.8.0", "ioredis": "^5.4.0", "node-cron": "^3.0.3", "pino": "^9.0.0" },
+  "dependencies": { "@tera/db": "*", "bullmq": "^5.8.0", "ioredis": "^5.4.0", "node-cron": "^3.0.3", "pino": "^9.0.0" },
   "devDependencies": { "@types/node": "^20.12.0", "@types/node-cron": "^3.0.11", "tsx": "^4.7.0", "typescript": "^5.4.0", "vitest": "^1.6.0" }
 }
